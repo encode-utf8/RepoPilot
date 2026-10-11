@@ -13,13 +13,21 @@ from repopilot.api.schemas import (
     TaskView,
 )
 from repopilot.errors import (
+    InvalidRequestError,
     RepoPilotError,
     ReportNotReadyError,
     TaskConflictError,
     TaskNotFoundError,
 )
 from repopilot.logging_setup import RunLogger
-from repopilot.models import TERMINAL_TASK_STATUSES, Report, Task, TaskStatus, utcnow
+from repopilot.models import (
+    TERMINAL_TASK_STATUSES,
+    PublishOutcome,
+    Report,
+    Task,
+    TaskStatus,
+    utcnow,
+)
 
 router = APIRouter(prefix="/api", tags=["tasks"])
 
@@ -122,6 +130,20 @@ def cancel_task(task_id: str, context=Depends(get_context)) -> CancelTaskRespons
     updated.progress = "cancel requested"
     context.store.save(updated)
     return CancelTaskResponse(**TaskView.from_task(updated).model_dump())
+
+
+@router.post("/tasks/{task_id}/pull-request", response_model=PublishOutcome)
+def publish_pull_request(task_id: str, context=Depends(get_context)) -> PublishOutcome:
+    """Publish a verified repair as a Draft PR (idempotent per task)."""
+
+    task = _load_task(context, task_id)
+    if not task.is_terminal:
+        raise TaskConflictError(
+            f"task {task_id} is still {task.status.value} and cannot be published yet"
+        )
+    if context.publisher is None:
+        raise InvalidRequestError("pull request publishing is not configured on this server")
+    return context.publisher.publish_task(task_id)
 
 
 def register_exception_handlers(app) -> None:

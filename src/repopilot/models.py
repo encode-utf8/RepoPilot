@@ -226,6 +226,39 @@ class VerificationInfo(BaseModel):
     notes: list[str] = Field(default_factory=list)
 
 
+class PullRequestInfo(BaseModel):
+    """Remote state of the Draft PR created for a task."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    number: int
+    url: str
+    title: str = ""
+    head_branch: str
+    base_branch: str
+    commit_sha: str | None = None
+    draft: bool = True
+    state: str = "open"
+    api_url: str | None = None
+
+
+class PublishOutcome(BaseModel):
+    """Result of the (idempotent) remote publish step."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    attempted: bool = False
+    status: Literal["created", "reused", "skipped", "failed"] = "skipped"
+    reason: str = ""
+    error_code: str | None = None
+    branch: str | None = None
+    base_branch: str | None = None
+    commit_sha: str | None = None
+    isolation: str | None = None
+    operations: list[str] = Field(default_factory=list)
+    pull_request: PullRequestInfo | None = None
+
+
 class Report(BaseModel):
     """Unified assessment report."""
 
@@ -244,6 +277,7 @@ class Report(BaseModel):
     summary: ReportSummary = Field(default_factory=ReportSummary)
     verification: VerificationInfo
     repair: RepairOutcome | None = None
+    publish: PublishOutcome | None = None
     failure_code: str | None = None
     failure_reason: str | None = None
     notes: list[str] = Field(default_factory=list)
@@ -475,6 +509,8 @@ class Task(BaseModel):
     termination_reason: str | None = None
     rounds: int = 0
     resumed_from: str | None = None
+    pull_request: PullRequestInfo | None = None
+    sandbox_isolation: str | None = None
 
     @property
     def is_terminal(self) -> bool:

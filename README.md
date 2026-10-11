@@ -12,7 +12,7 @@
 |---|---|---|
 | 阶段一 | 仓库接入与评估基线 | **已完成（本迭代）** |
 | 阶段二 | Agent 自动修复闭环 | **已完成（本迭代）** |
-| 阶段三 | GitHub 自动提交与 Draft PR | 未开始 |
+| 阶段三 | GitHub 自动提交与 Draft PR | **已完成（本迭代）** |
 | 阶段四 | 异步任务管理与交互整合 | 未开始 |
 | 阶段五 | 代码检索增强与评测工具链 | 未开始 |
 | 阶段六 | Agentic RL 能力扩展 | 未开始 |
@@ -87,6 +87,61 @@ Agent 只能调用这五个工具，全部在宿主侧校验路径与预算，�
 
 每轮都把状态与工具输出写入工作区 `artifacts/repair-state.json`；在请求里带 `resume_task_id` 可基于上次状态继续追加轮次。每轮执行都写入统一 `task_id` + `run_id` 的 JSONL 日志，为阶段六轨迹采集保留数据。
 
+## 阶段三交付内容
+
+在阶段二基础上新增「门禁通过后自动提交修复分支并创建 Draft PR」：从固定基线 commit 建分支 → 应用已验证补丁 → 提交 → 调用 GitHub REST API 创建 **Draft PR**，把 PR 链接与远端状态写回任务记录。**仅创建 Draft PR，绝不自动合并、绝不直接推送默认分支。**
+
+| 能力 | 实现位置 |
+|---|---|
+| 凭据集中管理（脱敏、懒读取） | `src/repopilot/credentials.py` |
+| GitHub 客户端边界（无 merge / 无默认分支推送操作） | `src/repopilot/github/base.py` |
+| REST 实现（错误码映射、响应大小上限） | `src/repopilot/github/rest.py` |
+| 离线 fake（测试不触网，记录读写调用） | `src/repopilot/github/fake.py` |
+| 门禁前置的幂等发布器（唯一远端写入口） | `src/repopilot/pipeline/publish.py` |
+| 容器隔离沙箱 | `src/repopilot/execution/container.py`、`src/repopilot/execution/sandbox.py` |
+
+### 发布流程与幂等
+
+`PullRequestPublisher` 是**唯一**执行远端写操作的地方；Agent 既不持有也无法接触 GitHub 写凭据。
+
+1. 门禁前置：仅当 `quality_gate.passed` 且 `result == fixed` 时才尝试发布，否则直接 `skipped`，**零远端调用**。
+2. 容器前置：默认 `REPOPILOT_PUBLISH_REQUIRES_CONTAINER=true`，非容器隔离的任务发布失败（`code_execution_not_isolated`），不触碰网络。
+3. 分支名由 `task_id` 推导（`repopilot/fix-<task_id>`），同一任务重复触发不会产生第二个分支。
+4. 已存在同任务 PR 时直接复用（`reused`）；分支名已存在但无 PR 视为冲突（`github_conflict`）。
+5. PR 创建失败会删除刚建的分支回滚，绝不留下半成品分支。
+6. PR 描述由**同一份**改动集生成（问题背景、修改说明、影响文件、测试命令、基线/修复后测试结果），不会与推送内容不一致。
+
+### 错误码与任务状态
+
+| 场景 | `error_code` | 任务状态 | 远端写 |
+|---|---|---|---|
+| 门禁未通过 / needs_review / publish 关闭 | （`skipped`） | 保持原状态 | 0 |
+| 非容器隔离 | `code_execution_not_isolated` | `failed` | 0 |
+| 权限不足 / token 无效 | `github_permission_denied` | `needs_review` | 0 |
+| 远端冲突（分支已存在、PR 已存在等） | `github_conflict` | `needs_review` | 0（不覆盖） |
+| API 失败 / 限流 / 不可达 | `github_unavailable` / `github_rate_limited` | `needs_review` | 已回滚 |
+
+### 凭据不泄漏（验证方式）
+
+- `Secret` / `GitHubCredentials` 的 `repr`、`str` 一律返回 `***REDACTED***`，只有 `get_secret_value()` 可取原文。
+- token 仅在构造请求头时读取，不进入任务记录、报告、结构化日志或沙箱环境。
+- `tests/test_phase3_e2e.py::test_credentials_never_reach_logs_report_or_sandbox` 断言 token 不出现在日志、报告、`repair-state.json`，且不在 `build_sandbox_env()` 生成的环境里。
+
+### 容器隔离（对外开放写的前置）
+
+`REPOPILOT_SANDBOX_BACKEND=container` 时使用 `ContainerSandboxExecutor`：`docker run` 参数含 `--network=none`、`--read-only`、`--cap-drop ALL`、`--security-opt no-new-privileges`、非 root `--user` 与 `--memory` / `--cpus` / `--pids-limit` 上限；仓库以 `:ro` 只读挂载，仅 artifacts 与隔离 HOME 可写；容器环境来自白名单，绝不透传宿主凭据。
+
+### GitHub 连通性与本地联调
+
+- fake 全流程：不接任何网络即可跑通「建分支 → 提交 → Draft PR」（`tests/test_phase3_e2e.py`）。
+- 真实联调：开启发布并注入凭据后创建 `repair` 任务（本地镜像仓库需用 `REPOPILOT_GITHUB_REPO_SLUG` 指定远端 `owner/name`）：
+
+```powershell
+$env:REPOPILOT_ENABLE_GITHUB_PUBLISH = "true"
+$env:REPOPILOT_GITHUB_TOKEN = "<token>"           # 仅写入进程环境，绝不入库/日志
+$env:REPOPILOT_GITHUB_REPO_SLUG = "acme/widget"   # 本地镜像仓库时指定远端 owner/name
+```
+
 ## 快速开始
 
 ```powershell
@@ -120,6 +175,7 @@ Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/tasks/$($task.task_id)/report"
 | `GET` | `/api/tasks/{task_id}/report` | 获取统一评估报告；未到达终态时返回 409 |
 | `GET` | `/api/tasks/{task_id}/logs` | 获取结构化 JSONL 日志（支持 `?tail=N`） |
 | `POST` | `/api/tasks/{task_id}/cancel` | 请求协作式取消（202）；任务已是终态时返回 409 |
+| `POST` | `/api/tasks/{task_id}/pull-request` | 为门禁通过的修复创建/复用 Draft PR；任务未到终态返回 409 |
 | `GET` | `/api/health` | 健康检查（非任务端点） |
 
 请求体：
@@ -229,6 +285,21 @@ $env:REPOPILOT_MODEL_API_KEY = "EMPTY"   # vLLM 默认不校验
 | `REPOPILOT_AGENT_MAX_TOOL_OUTPUT_BYTES` | `200000` | 单次工具输出上限 |
 | `REPOPILOT_AGENT_MAX_DIFF_LINES` | `400` | 补丁行数上限 |
 | `REPOPILOT_AGENT_MAX_CHANGED_FILES` | `10` | 补丁文件数上限 |
+| `REPOPILOT_ENABLE_GITHUB_PUBLISH` | `false` | 是否允许创建修复分支与 Draft PR（默认关闭） |
+| `REPOPILOT_GITHUB_TOKEN_ENV` | `REPOPILOT_GITHUB_TOKEN` | 存放 GitHub token 的环境变量名（值不落盘） |
+| `REPOPILOT_GITHUB_API_BASE_URL` | `https://api.github.com` | GitHub API 基址（可指向 GHES） |
+| `REPOPILOT_GITHUB_API_TIMEOUT_SECONDS` | `30` | 单次 GitHub API 超时 |
+| `REPOPILOT_GITHUB_MAX_RESPONSE_BYTES` | `1000000` | GitHub 响应大小上限 |
+| `REPOPILOT_GITHUB_REPO_SLUG` | 空 | 本地镜像仓库时指定远端 `owner/name` |
+| `REPOPILOT_GITHUB_BASE_BRANCH` | `main` | 创建 PR 的目标基分支（优先采用仓库默认分支） |
+| `REPOPILOT_GITHUB_BRANCH_PREFIX` | `repopilot/fix-` | 修复分支名前缀 |
+| `REPOPILOT_GITHUB_MAX_CHANGED_FILES` | `50` | 单次发布改动文件数上限 |
+| `REPOPILOT_GITHUB_MAX_COMMIT_BYTES` | `2000000` | 单次发布改动总字节上限 |
+| `REPOPILOT_SANDBOX_BACKEND` | `local` | 沙箱后端：`local` / `container` |
+| `REPOPILOT_PUBLISH_REQUIRES_CONTAINER` | `true` | 发布前是否必须容器隔离 |
+| `REPOPILOT_DOCKER_IMAGE` | `python:3.11-slim` | 容器镜像 |
+| `REPOPILOT_CONTAINER_MEMORY` / `_CPUS` / `_PIDS_LIMIT` | `1g` / `1.0` / `256` | 容器资源上限 |
+| `REPOPILOT_CONTAINER_TIMEOUT_SECONDS` | `600` | 容器单条命令超时 |
 
 ## Fixtures 与测试
 
@@ -250,9 +321,13 @@ $env:REPOPILOT_MODEL_API_KEY = "EMPTY"   # vLLM 默认不校验
 
 阶段二在 `tests/test_repair_e2e.py` 增加确定性端到端测试（用 stub 模型）：给定 fixture 仓库与明确问题，完成定位 → 补丁 → 测试 → 判定，产出补丁、质量门禁结论与完整执行记录；并覆盖超限终止、作弊补丁拦截、模型不可用/输出不可解析、未受信来源不执行、以及基于已保存状态的续跑。
 
+阶段三在 `tests/test_publish.py`、`tests/test_container_sandbox.py`、`tests/test_phase3_e2e.py` 增加：伪造 GitHub API 的端到端测试（门禁通过 → 建分支 → 提交 → Draft PR → 任务记录含 PR 链接）；门禁拦截时断言零远端写；权限不足 / 冲突 / API 失败 / 重复提交的状态与错误码；容器 argv 加固断言；以及凭据不进入日志、报告、状态文件与沙箱环境。
+
 ## 本迭代明确不做
 
 阶段二明确不做：任何 GitHub 写操作（分支 / 提交 / Draft PR）、Redis / PostgreSQL / Dify、Milvus / 向量检索、Agentic RL，以及「自主判断并修复任意仓库的任意问题」。代码执行路径仍默认关闭，仅在受控 fixture 上启用。
+
+阶段三明确不做：自动合并、推送到默认分支、Redis / PostgreSQL / Dify、Milvus / 向量检索、Agentic RL。首版仅 Draft PR，远端写操作只能由后端 PR 模块执行，且默认要求容器隔离。
 
 ## 目录结构
 

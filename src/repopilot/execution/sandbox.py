@@ -50,6 +50,8 @@ class LocalProcessSandboxExecutor:
     source is trusted. Container isolation is a later phase (see open questions).
     """
 
+    isolation_kind = "local-process"
+
     def __init__(self, settings: Settings, workspace: Workspace, *, trusted_source: bool) -> None:
         self._settings = settings
         self._workspace = workspace
@@ -91,3 +93,35 @@ class LocalProcessSandboxExecutor:
             env=env,
             token=token,
         )
+
+
+def build_sandbox(
+    settings: Settings,
+    workspace: Workspace,
+    *,
+    trusted_source: bool,
+    docker_runner=None,
+) -> SandboxExecutor:
+    """Return the configured :class:`SandboxExecutor` for one task.
+
+    ``local`` uses the hardened local process runner. ``container`` requires the
+    Docker CLI and is mandatory before a task may perform remote writes.
+    """
+
+    from repopilot.errors import InvalidRequestError, SandboxUnavailableError
+    from repopilot.execution.container import ContainerSandboxExecutor
+
+    backend = (settings.sandbox_backend or "local").strip().lower()
+    if backend == "local":
+        return LocalProcessSandboxExecutor(settings, workspace, trusted_source=trusted_source)
+    if backend == "container":
+        executor = ContainerSandboxExecutor(
+            settings, workspace, trusted_source=trusted_source, runner=docker_runner
+        )
+        if not executor.available():
+            raise SandboxUnavailableError(
+                "container sandbox was requested but the docker CLI is not available; "
+                "install docker or set REPOPILOT_SANDBOX_BACKEND=local for non publishing runs"
+            )
+        return executor
+    raise InvalidRequestError(f"unknown sandbox backend {settings.sandbox_backend!r}")

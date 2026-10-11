@@ -108,3 +108,57 @@ class TestsUnavailableError(RepoPilotError):
     """The baseline test run could not be executed or parsed."""
 
     code = "tests_unavailable"
+
+
+class SandboxUnavailableError(RepoPilotError):
+    """A requested sandbox backend (for example Docker) is not available."""
+
+    code = "sandbox_unavailable"
+
+
+class CodeExecutionNotIsolatedError(RepoPilotError):
+    """A remote write was requested without the required container isolation."""
+
+    code = "code_execution_not_isolated"
+
+
+class GitHubError(RepoPilotError):
+    """Base class for GitHub integration failures."""
+
+    code = "github_error"
+
+
+class GitHubNotConfiguredError(GitHubError):
+    """Publishing was requested but no credential provider or slug is configured."""
+
+    code = "github_not_configured"
+
+
+class GitHubAuthError(GitHubError):
+    """The token is missing, invalid or lacks the required repository scope."""
+
+    code = "github_permission_denied"
+
+
+class GitHubRateLimitError(GitHubError):
+    """The GitHub API rate limit was hit."""
+
+    code = "github_rate_limited"
+
+
+class GitHubConflictError(GitHubError):
+    """A branch, ref or pull request already exists in an incompatible state."""
+
+    code = "github_conflict"
+
+
+class GitHubUnavailableError(GitHubError):
+    """The GitHub API could not be reached (network, timeout or 5xx)."""
+
+    code = "github_unavailable"
+
+
+class GitHubApiError(GitHubError):
+    """An unexpected GitHub API response."""
+
+    code = "github_api_error"
