@@ -1,0 +1,2 @@
+pyyaml
+tomli>=2.0

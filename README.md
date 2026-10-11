@@ -10,37 +10,180 @@
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
-| 阶段一 | 仓库接入与评估基线 | 待开发（当前迭代） |
+| 阶段一 | 仓库接入与评估基线 | **已完成（本迭代）** |
 | 阶段二 | Agent 自动修复闭环 | 未开始 |
 | 阶段三 | GitHub 自动提交与 Draft PR | 未开始 |
 | 阶段四 | 异步任务管理与交互整合 | 未开始 |
 | 阶段五 | 代码检索增强与评测工具链 | 未开始 |
 | 阶段六 | Agentic RL 能力扩展 | 未开始 |
 
-当前仓库仅包含设计文档，尚无源码。
+## 阶段一交付内容
 
-## 技术栈
+输入受信任的 Python 仓库地址后，服务自动克隆仓库、固定基线 commit、扫描项目、执行确定性检查，并生成结构化评估报告。
 
-Python / FastAPI（后端服务）· LangGraph（Agent 编排）· vLLM（模型推理）· Dify（交互入口）· Milvus（向量检索）· Docker（代码执行沙箱）· Ruff / pytest（代码质量）· GitHub App + REST API（仓库集成）· PostgreSQL / Redis（任务与数据）· Agent Lightning（强化学习）
+| 能力 | 实现位置 |
+|---|---|
+| FastAPI 后端与任务端点 | `src/repopilot/api/routes.py`、`src/repopilot/app.py` |
+| 任务模型与状态机 | `src/repopilot/models.py` |
+| 克隆与基线 commit 固定 | `src/repopilot/execution/git.py` |
+| 受控子进程执行（超时/输出上限/环境隔离） | `src/repopilot/execution/process.py`、`src/repopilot/execution/sandbox.py` |
+| 项目扫描与 Python 识别 | `src/repopilot/scan/scanner.py` |
+| 检查器（Ruff / pytest / 依赖风险 / 启发式） | `src/repopilot/checkers/` |
+| 统一评估报告 | `src/repopilot/report/builder.py` |
+| 评估流水线编排 | `src/repopilot/pipeline/evaluate.py` |
+| 结构化 JSONL 日志（task_id + run_id） | `src/repopilot/logging_setup.py` |
+| 受控 fixture 仓库 | `fixtures/`、`src/repopilot/fixtures.py` |
 
-## 迭代推进方式
+### 预留的抽象边界
 
-每个阶段都产出**可独立运行**的交付物，按依赖关系顺序推进，核心原则：
+后续阶段可替换实现而不改动调用方：
 
-先完成仓库检查，再实现 Agent 修复；先跑通本地验证，再接入 GitHub 写操作；先打通基础任务管理，再引入 Dify 和 Milvus；先保证执行轨迹完整，再开发 Agentic RL。
+| 边界 | 协议位置 | 阶段一实现 | 后续替换方向 |
+|---|---|---|---|
+| `TaskStore` | `src/repopilot/storage/base.py` | `InMemoryTaskStore` | PostgreSQL（阶段四） |
+| `TaskScheduler` | `src/repopilot/scheduler/base.py` | `ThreadPoolTaskScheduler` | Redis / 任务队列（阶段四） |
+| `SandboxExecutor` | `src/repopilot/execution/sandbox.py` | `LocalProcessSandboxExecutor` | Docker 隔离执行 |
+| `Checker` | `src/repopilot/checkers/base.py` | Ruff / pytest / pip-audit / heuristics | 新增或替换检查器 |
 
-## 目录结构（规划）
+## 快速开始
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+
+# 1) 物化受控 fixture 仓库（生成真实 git 仓库，含两个 commit）
+.\.venv\Scripts\python.exe scripts\make_fixtures.py --destination .fixtures-repos
+
+# 2) 声明受信任来源，使 fixture 上允许执行仓库代码
+$env:REPOPILOT_TRUSTED_SOURCE_ROOTS = (Resolve-Path .fixtures-repos).Path
+
+# 3) 启动服务
+.\.venv\Scripts\python.exe -m repopilot
+```
+
+```powershell
+# 4) 创建评估任务并轮询
+$body = @{ repo_url = (Resolve-Path .fixtures-repos\py_calc_buggy).Path } | ConvertTo-Json
+$task = Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/tasks -ContentType application/json -Body $body
+Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/tasks/$($task.task_id)"
+Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/tasks/$($task.task_id)/report"
+```
+
+## API
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `POST` | `/api/tasks` | 创建评估任务，**立即返回** `task_id`，后台异步执行（202） |
+| `GET` | `/api/tasks/{task_id}` | 查询任务状态、固定 commit、失败原因与问题摘要 |
+| `GET` | `/api/tasks/{task_id}/report` | 获取统一评估报告；未到达终态时返回 409 |
+| `GET` | `/api/tasks/{task_id}/logs` | 获取结构化 JSONL 日志（支持 `?tail=N`） |
+| `POST` | `/api/tasks/{task_id}/cancel` | 请求协作式取消（202）；任务已是终态时返回 409 |
+| `GET` | `/api/health` | 健康检查（非任务端点） |
+
+请求体：
+
+```json
+{ "repo_url": "https://github.com/org/repo.git", "base_branch": "main", "base_commit": null }
+```
+
+`base_commit` 优先；未提供时解析 `base_branch` 的 HEAD，未提供 `base_branch` 时使用远端默认分支 HEAD。
+解析结果（`resolved_commit`）会写回任务记录，并在报告中出现，保证结果可复现。
+
+重复提交相同 `repo_url` + `base_branch` + `base_commit` 的活跃任务时返回既有 `task_id`（`deduplicated: true`）。
+
+## 检查器与选型
+
+| 检查器 | 工具 | 产出问题类型 | 验证级别 |
+|---|---|---|---|
+| 静态检查 | Ruff（`ruff check --output-format json`） | `lint` | 工具已确认 |
+| 测试执行 | pytest（JUnit XML 解析） | `test_failure` / `test_error` | 工具已确认 |
+| 依赖风险 | pip-audit（JSON） | `dependency_vulnerability` | 工具已确认 |
+| 启发式提示 | 内置静态文本扫描 | `dependency_pinning` / `weak_verification` / `error_swallowing` / `verification_gap` | **未验证的潜在问题** |
+
+**依赖扫描选型理由**：优先 `pip-audit`——由 PyPA 维护，直接查询公开的 OSV / PyPI 漏洞库而**无需账号或令牌**（因此不会有凭据进入沙箱），输出机器可读 JSON，并且可以直接审计 requirements 文件而不改动环境。对比方案：`safety` 完整结果需要付费/认证的漏洞库 API；`osv-scanner` 需要额外安装 Go 二进制；`pip list --outdated` 根本不是漏洞库。
+
+未受信任来源的依赖审计会追加 `--no-deps`，避免为解析传递依赖而下载并构建第三方 sdist。
+
+## 任务状态与判定
+
+| 状态 | 含义 |
+|---|---|
+| `pending` / `running` | 排队中 / 执行中 |
+| `succeeded` | 全部必需检查器均已运行，报告可信 |
+| `needs_review` | 存在必需检查器未能运行（例如非受信来源禁用代码执行），结论不完整，**不等同成功** |
+| `failed` | 克隆、解析 commit 或检查器本身失败，`failure_reason` 给出明确原因 |
+| `cancelled` | 收到取消请求 |
+
+判定规则（`src/repopilot/pipeline/evaluate.py`）：任一步骤抛错 → `failed`；任一检查器状态为 `error` → `failed`；存在「必需但未运行」的检查器 → `needs_review`；否则 `succeeded`。取消请求优先于上述所有判定。
+
+报告同时给出两类问题列表，二者不混淆：
+
+- `confirmed_issues`：工具直接确认的问题（origin 通常为 `tool`）。
+- `unverified_issues`：未验证的潜在问题，必须人工确认，不计入确认问题汇总。
+
+## 安全约束（硬性）
+
+- **禁止 shell**：所有子进程使用参数列表调用，代码中不存在 `shell=True`。
+- **超时与输出上限**：每个子进程都有超时（含硬上限 `REPOPILOT_MAX_COMMAND_TIMEOUT_SECONDS`）与输出字节上限，超时通过 `taskkill /T`（Windows）或进程组 `SIGKILL`（POSIX）终止整个进程树。
+- **环境变量白名单**：子进程只继承 `REPOPILOT_ENV_ALLOWLIST` 中的变量并注入确定性变量；`GITHUB_TOKEN`、`AWS_SECRET_ACCESS_KEY` 等凭据不会传入。`GIT_TERMINAL_PROMPT=0` 与空 gitconfig 避免交互式提示与宿主凭据助手。
+- **凭据绝不落盘**：日志写入前递归脱敏（敏感键名 + token 形态正则）；报告不包含环境变量。
+- **不可信代码默认不执行**：只有 `repo_url` 位于 `REPOPILOT_TRUSTED_SOURCE_ROOTS` 之下（或显式开启 `REPOPILOT_ALLOW_UNTRUSTED_CODE_EXECUTION`）才允许执行仓库代码。第三方仓库的 pytest 会被拒绝执行，任务落到 `needs_review`。
+- 执行仓库代码时，`HOME`/`TEMP` 被重定向到任务工作区内部。
+
+## 配置
+
+全部通过 `REPOPILOT_*` 环境变量覆盖（默认值见 `src/repopilot/config.py`）：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `REPOPILOT_WORKSPACE_ROOT` | 系统临时目录下的 `repopilot/workspaces` | 任务工作区根目录（刻意放在控制仓库之外） |
+| `REPOPILOT_LOG_DIR` | 系统临时目录下的 `repopilot/logs` | JSONL 日志与报告副本 |
+| `REPOPILOT_TRUSTED_SOURCE_ROOTS` | 空 | 受控 fixture 目录列表（`os.pathsep` 分隔） |
+| `REPOPILOT_ALLOW_UNTRUSTED_CODE_EXECUTION` | `false` | 是否允许对非受信来源执行仓库代码 |
+| `REPOPILOT_COMMAND_TIMEOUT_SECONDS` | `300` | 单条命令超时 |
+| `REPOPILOT_MAX_COMMAND_TIMEOUT_SECONDS` | `900` | 单条命令超时硬上限 |
+| `REPOPILOT_CLONE_TIMEOUT_SECONDS` | `180` | 克隆超时 |
+| `REPOPILOT_DEPENDENCY_AUDIT_TIMEOUT_SECONDS` | `180` | 依赖审计超时 |
+| `REPOPILOT_MAX_OUTPUT_BYTES` | `2000000` | 单流输出上限 |
+| `REPOPILOT_ENABLE_RUFF` / `_PYTEST` / `_DEPENDENCY_AUDIT` / `_HEURISTICS` | `true` | 检查器开关 |
+| `REPOPILOT_REQUIRE_PYTEST_FOR_DETECTED_TESTS` | `true` | 检测到测试时，pytest 未运行即视为未验证 |
+| `REPOPILOT_REQUIRE_DEPENDENCY_AUDIT` | `false` | 依赖审计不可用时是否降级为 `needs_review` |
+| `REPOPILOT_KEEP_WORKSPACE` | `true` | 任务结束后是否保留工作区 |
+| `REPOPILOT_SCHEDULER_MAX_WORKERS` | `4` | 后台线程数 |
+
+## Fixtures 与测试
+
+`fixtures/` 下提供两个受控仓库模板，`scripts/make_fixtures.py` 会将其物化为真实 git 仓库（含基线 commit 与后续 commit，用于验证 commit 固定）：
+
+| Fixture | 已知可检出问题 |
+|---|---|
+| `py_calc_buggy` | Ruff `F401`/`F821`/`F841`/`E711`/`B006`；1 个失败测试；1 个未固定版本依赖 |
+| `py_lib_clean` | 无 Ruff 问题、测试全绿、含 1 个被跳过的测试（启发式未验证提示） |
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest              # 全部单元测试 + 端到端测试
+.\.venv\Scripts\python.exe -m ruff check .
+.\.venv\Scripts\python.exe -m ruff format --check .
+```
+
+端到端测试覆盖：`POST /api/tasks` → 轮询至 `succeeded` → `/report` 返回合规问题列表；不可达远端优雅失败（`failed` + `failure_reason`）；非受信来源落到 `needs_review`；取消运行中的任务落到 `cancelled`。
+
+## 本迭代明确不做
+
+LLM / vLLM / LangGraph 调用、代码自动修复、任何 GitHub 写操作（分支 / 提交 / PR）、Redis / PostgreSQL / Dify / Milvus、Agentic RL。未引入这些依赖。
+
+## 目录结构
 
 ```
-RepoPilot.md                     # 项目设计文档（唯一事实来源）
+RepoPilot.md                  # 项目设计文档（唯一事实来源）
 README.md
-docs/                            # 架构说明、接口契约、开发与部署文档
-tests/                           # 单元测试与端到端回归测试
+pyproject.toml                # 依赖、ruff 与 pytest 配置
+docs/open-questions.md        # 设计文档未定义处的决策记录
+fixtures/                     # 受控 fixture 仓库模板
+scripts/make_fixtures.py      # 物化 fixture 为真实 git 仓库
+src/repopilot/                # 后端服务与评估流水线
+tests/                        # 单元测试与端到端回归测试
 ```
-
-## 当前迭代
-
-迭代目标：阶段一「仓库接入与评估基线」（设计文档 §4 阶段一）。
 
 ## 参与约定
 
