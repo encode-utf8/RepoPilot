@@ -29,6 +29,7 @@ from repopilot.errors import (
 )
 from repopilot.execution.process import CommandResult, build_sandbox_env, run_command
 from repopilot.github.base import FileChange, GitHubClient, GitHubPullRequest, TreeEntry
+from repopilot.locking import InMemoryLockManager, LockManager, hold_lock
 from repopilot.logging_setup import RunLogger
 from repopilot.models import PublishOutcome, PullRequestInfo, Task, TaskStatus, utcnow
 from repopilot.storage.base import TaskStore
@@ -280,10 +281,12 @@ class PullRequestPublisher:
         settings: Settings,
         store: TaskStore,
         client: GitHubClient | None,
+        lock_manager: LockManager | None = None,
     ) -> None:
         self._settings = settings
         self._store = store
         self._client = client
+        self._lock_manager: LockManager = lock_manager or InMemoryLockManager()
 
     # -- public API ------------------------------------------------------------
 
@@ -301,7 +304,28 @@ class PullRequestPublisher:
             raise TaskNotFoundError(f"unknown task id: {task_id}")
         logger = RunLogger(self._settings.log_dir, task.task_id, task.run_id)
 
-        outcome = self._publish(task, require_terminal=require_terminal)
+        with hold_lock(
+            self._lock_manager,
+            f"publish:{task_id}",
+            ttl_seconds=self._settings.publish_lock_ttl_seconds,
+        ) as acquired:
+            if not acquired:
+                # Another worker holds the lock. Do not persist anything: the
+                # winner owns the record, and clobbering it would hide a
+                # successful publish.
+                logger.event(
+                    "pr.locked",
+                    "another worker is already publishing this task",
+                    level="warning",
+                )
+                return PublishOutcome(
+                    attempted=False,
+                    status="skipped",
+                    error_code="publish_in_progress",
+                    reason="another worker is already publishing this task",
+                    isolation=task.sandbox_isolation,
+                )
+            outcome = self._publish(task, require_terminal=require_terminal)
         if outcome.status in {"created", "reused"} and outcome.pull_request is not None:
             logger.event(
                 f"pr.{outcome.status}",

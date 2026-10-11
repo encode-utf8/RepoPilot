@@ -1,0 +1,36 @@
+# Local Redis and PostgreSQL for the Phase 4 async deployment.
+#
+#   docker compose up -d
+#   REPOPILOT_TEST_REDIS_URL=redis://127.0.0.1:6379/0 \
+#     REPOPILOT_TEST_POSTGRES_DSN=postgresql://repopilot:repopilot@127.0.0.1:5432/repopilot \
+#     pytest tests/test_integration_services.py
+services:
+  redis:
+    image: redis:7-alpine
+    command: ['redis-server', '--save', '', '--appendonly', 'no']
+    ports:
+      - '6379:6379'
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: repopilot
+      POSTGRES_PASSWORD: repopilot
+      POSTGRES_DB: repopilot
+    ports:
+      - '5432:5432'
+    volumes:
+      - repopilot-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U repopilot -d repopilot']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  repopilot-pgdata:

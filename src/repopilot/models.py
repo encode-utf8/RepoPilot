@@ -509,6 +509,8 @@ class Task(BaseModel):
     termination_reason: str | None = None
     rounds: int = 0
     resumed_from: str | None = None
+    #: Task this one was retried from, when created via the retry endpoint.
+    retried_from: str | None = None
     pull_request: PullRequestInfo | None = None
     sandbox_isolation: str | None = None
 
