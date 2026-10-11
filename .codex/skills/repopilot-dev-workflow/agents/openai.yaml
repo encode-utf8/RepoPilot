@@ -1,0 +1,4 @@
+interface:
+  display_name: "RepoPilot 改动交付流程"
+  short_description: "Branch first, keep design docs in sync, verify, then commit."
+  default_prompt: "Use $repopilot-dev-workflow to deliver this RepoPilot change."
