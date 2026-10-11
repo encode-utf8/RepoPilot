@@ -36,6 +36,7 @@ coverage.xml
 # Runtime artifacts (task workspaces, cloned repos, logs, reports)
 .workdir/
 .workspaces/
+.fixtures-repos/
 runs/
 logs/
 *.log
