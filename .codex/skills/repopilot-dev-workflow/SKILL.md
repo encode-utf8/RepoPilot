@@ -72,6 +72,7 @@ feat(execution): pin baseline commit for repository checkout
    git fetch --prune
    ```
    `-d` 只在确认已合并时才成功，不要用 `-D` 绕过；删除**已合并**分支是安全的例行操作。
+  若分支从未推送到远端，`git push origin --delete` 会报 `remote ref does not exist`；这是正常情况，确认远端分支列表后继续即可。
 5. 存在多个待合并分支时，按依赖顺序依次执行 1–4。
 
 仍需用户确认的例外（这些不是例行操作，必须显式请求后才做）：
