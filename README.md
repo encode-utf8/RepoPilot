@@ -34,19 +34,16 @@ Python / FastAPI（后端服务）· LangGraph（Agent 编排）· vLLM（模型
 ```
 RepoPilot.md                     # 项目设计文档（唯一事实来源）
 README.md
-prompts/                         # 面向 coding agent 的分阶段实施提示词
-  phase-01-repository-intake-and-evaluation-baseline.md
 docs/                            # 架构说明、接口契约、开发与部署文档
 tests/                           # 单元测试与端到端回归测试
 ```
 
 ## 当前迭代
 
-- 迭代目标：阶段一「仓库接入与评估基线」
-- 执行提示词：[`prompts/phase-01-repository-intake-and-evaluation-baseline.md`](prompts/phase-01-repository-intake-and-evaluation-baseline.md)
+迭代目标：阶段一「仓库接入与评估基线」（设计文档 §4 阶段一）。
 
 ## 参与约定
 
 - 默认分支 `main`，改动通过分支 + PR 提交，PR 描述需说明改动范围与验证方式。
 - 提交信息使用 Conventional Commits（如 `feat:`、`fix:`、`test:`、`docs:`、`chore:`）。
-- 合并前需通过 lint、格式化与测试（详见各阶段提示词中的 Definition of Done）。
+- 合并前需通过 lint、格式化与测试（详见设计文档 §5 工程验收标准）。
