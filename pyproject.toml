@@ -5,13 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "repopilot"
 version = "0.1.0"
-description = "RepoPilot phase 1: repository onboarding and deterministic assessment baseline."
+description = "RepoPilot: LLM-driven GitHub repository assessment and automated repair agent."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115",
     "uvicorn>=0.30",
     "pydantic>=2.7",
+    "langgraph>=1.0",
 ]
 
 [project.optional-dependencies]
