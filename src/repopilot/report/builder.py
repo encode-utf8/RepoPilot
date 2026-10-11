@@ -7,13 +7,16 @@ be mistaken for a clean one.
 
 from __future__ import annotations
 
+import contextlib
 from collections import Counter
+from pathlib import Path
 
 from repopilot.models import (
     CheckerResult,
     CheckerStatus,
     Issue,
     ProjectProfile,
+    RepairOutcome,
     RepoMetadata,
     Report,
     ReportSummary,
@@ -59,6 +62,7 @@ def build_report(
     failure_code: str | None = None,
     failure_reason: str | None = None,
     notes: list[str] | None = None,
+    repair: RepairOutcome | None = None,
 ) -> Report:
     """Assemble a fully populated, self describing report."""
 
@@ -95,12 +99,23 @@ def build_report(
         if not checker.ran and checker.status is not CheckerStatus.not_applicable
     ]
 
+    report_notes = list(notes or [])
+    gate_passed: bool | None = None
+    if repair is not None:
+        # A repair report is verified by the quality gate, not by checkers.
+        gaps = [f"quality_gate: {blocker}" for blocker in repair.quality_gate.blockers]
+        unverified_reasons = list(repair.quality_gate.blockers)
+        gate_passed = repair.quality_gate.passed
+        report_notes.extend(repair.quality_gate.warnings)
+
     verification = VerificationInfo(
         code_execution_enabled=repo.code_execution_enabled,
-        fully_verified=status is TaskStatus.succeeded and not gaps,
+        fully_verified=(
+            status is TaskStatus.succeeded and not gaps and (gate_passed is None or gate_passed)
+        ),
         verification_gaps=gaps,
         unverified_reasons=unverified_reasons,
-        notes=notes or [],
+        notes=report_notes,
     )
 
     return Report(
@@ -115,7 +130,21 @@ def build_report(
         unverified_issues=unverified,
         summary=summary,
         verification=verification,
+        repair=repair,
         failure_code=failure_code,
         failure_reason=failure_reason,
-        notes=notes or [],
+        notes=report_notes,
     )
+
+
+def persist_report(settings, report: Report, workspace, *, filename: str = "report.json") -> None:
+    """Write the report next to the workspace artifacts and in the log directory."""
+
+    payload = report.model_dump_json(indent=2)
+    if workspace is not None:
+        with contextlib.suppress(OSError):
+            (workspace.artifacts_dir / filename).write_text(payload, encoding="utf-8")
+    reports_dir = Path(settings.log_dir) / "reports"
+    with contextlib.suppress(OSError):
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        (reports_dir / f"{report.task_id}.json").write_text(payload, encoding="utf-8")

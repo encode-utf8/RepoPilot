@@ -42,9 +42,10 @@ def _load_task(context, task_id: str) -> Task:
 
 @router.post("/tasks", status_code=status.HTTP_202_ACCEPTED, response_model=CreateTaskResponse)
 def create_task(payload: CreateTaskRequest, context=Depends(get_context)) -> CreateTaskResponse:
-    """Create an assessment task and start it in the background."""
+    """Create an assessment or repair task and start it in the background."""
 
     task_request = payload.to_task_request()
+    runner = context.runner_for(task_request.mode)
     existing = context.store.find_active_by_key(task_request.dedupe_key())
     if existing is not None:
         return CreateTaskResponse(
@@ -63,7 +64,7 @@ def create_task(payload: CreateTaskRequest, context=Depends(get_context)) -> Cre
         updated_at=utcnow(),
     )
     stored = context.store.create(task)
-    context.scheduler.submit(stored.task_id, context.submit(stored.task_id))
+    context.scheduler.submit(stored.task_id, context.submit(stored.task_id, runner))
     return CreateTaskResponse(task_id=stored.task_id, run_id=stored.run_id, status=stored.status)
 
 

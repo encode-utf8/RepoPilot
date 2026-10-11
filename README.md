@@ -11,7 +11,7 @@
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | 阶段一 | 仓库接入与评估基线 | **已完成（本迭代）** |
-| 阶段二 | Agent 自动修复闭环 | 未开始 |
+| 阶段二 | Agent 自动修复闭环 | **已完成（本迭代）** |
 | 阶段三 | GitHub 自动提交与 Draft PR | 未开始 |
 | 阶段四 | 异步任务管理与交互整合 | 未开始 |
 | 阶段五 | 代码检索增强与评测工具链 | 未开始 |
@@ -44,6 +44,48 @@
 | `TaskScheduler` | `src/repopilot/scheduler/base.py` | `ThreadPoolTaskScheduler` | Redis / 任务队列（阶段四） |
 | `SandboxExecutor` | `src/repopilot/execution/sandbox.py` | `LocalProcessSandboxExecutor` | Docker 隔离执行 |
 | `Checker` | `src/repopilot/checkers/base.py` | Ruff / pytest / pip-audit / heuristics | 新增或替换检查器 |
+| `ModelClient` | `src/repopilot/llm/base.py` | `StubModelClient` / `OpenAICompatibleModelClient` | 真实 vLLM 或其它推理后端 |
+| 受控工具集 | `src/repopilot/agent/tools.py` | `read_file` / `search_code` / `apply_patch` / `run_tests` / `view_diff` | 扩展只读或写入工具 |
+
+## 阶段二交付内容
+
+在阶段一基础上新增 `mode=repair` 的 Agent 自动修复闭环：任务理解 → 仓库探索 → 代码定位 → 生成补丁 → 执行工具 → 分析反馈 → 重试或终止 → 结果汇总。Agent 只能经下方受控工具操作工作区，没有任意 shell 能力，也不持有 GitHub 写凭据。
+
+| 能力 | 实现位置 |
+|---|---|
+| 模型抽象（OpenAI 兼容，真实指向 vLLM） | `src/repopilot/llm/base.py`、`src/repopilot/llm/openai_client.py` |
+| 确定性 stub（离线跑通全流程） | `src/repopilot/llm/stub.py` |
+| provider 切换与连通性探测 | `src/repopilot/llm/registry.py`、`src/repopilot/llm/health.py` |
+| LangGraph 修复工作流 | `src/repopilot/agent/graph.py` |
+| 受控工具集（Agent 唯一入口） | `src/repopilot/agent/tools.py` |
+| 有限循环预算控制 | `src/repopilot/agent/limits.py` |
+| 质量门禁（设计文档 §3.6） | `src/repopilot/agent/quality_gate.py` |
+| 修复流水线与状态持久化 | `src/repopilot/pipeline/repair.py` |
+| 共享 pytest 运行与 JUnit 解析 | `src/repopilot/execution/test_run.py` |
+
+### 受控工具集
+
+Agent 只能调用这五个工具，全部在宿主侧校验路径与预算，无 `shell=True`：
+
+| 工具 | 作用 |
+|---|---|
+| `read_file` | 读取工作区内文本文件（带行号窗口）或列出目录 |
+| `search_code` | 工作区内正则搜索，可限制 glob 与结果上限 |
+| `apply_patch` | 用 `git apply` 应用统一 diff（先 `--check`） |
+| `run_tests` | 经阶段一 `SandboxExecutor` 运行 pytest 并解析 JUnit XML |
+| `view_diff` | 查看当前工作区改动 |
+
+### 有限循环控制
+
+命中任一上限即终止，并把原因写入 `termination_reason`：最大修复轮数、总执行时间、模型调用次数、模型 token 预算、工具调用次数、单次工具输出上限、补丁行数与文件数。重复应用同一补丁会触发 `no_progress`。
+
+### 质量门禁（设计文档 §3.6）
+
+七项检查全部通过才算修复成功：`patch_applied`、`tests_executed`、`baseline_attributable`、`target_tests_pass`、`no_regression`、`change_scope`、`no_cheating`。删除或跳过测试、弱化断言、把断言改成恒真等作弊行为会被拒绝并标记 `cheating_detected`；无法确认时落到 `needs_review` / `failed`，绝不报成功。
+
+### 状态持久化与续跑
+
+每轮都把状态与工具输出写入工作区 `artifacts/repair-state.json`；在请求里带 `resume_task_id` 可基于上次状态继续追加轮次。每轮执行都写入统一 `task_id` + `run_id` 的 JSONL 日志，为阶段六轨迹采集保留数据。
 
 ## 快速开始
 
@@ -85,6 +127,7 @@ Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/tasks/$($task.task_id)/report"
 ```json
 { "repo_url": "https://github.com/org/repo.git", "base_branch": "main", "base_commit": null }
 ```
+`mode` 可取 `assess`（默认，阶段一评估）或 `repair`（阶段二自动修复）。`repair` 任务必须提供 `problem`；可选 `target_tests`（缺省则以基线失败的测试为目标）、`allowed_paths`（额外允许改动的路径）与 `resume_task_id`（基于已保存状态续跑）。
 
 `base_commit` 优先；未提供时解析 `base_branch` 的 HEAD，未提供 `base_branch` 时使用远端默认分支 HEAD。
 解析结果（`resolved_commit`）会写回任务记录，并在报告中出现，保证结果可复现。
@@ -121,6 +164,27 @@ Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/tasks/$($task.task_id)/report"
 - `confirmed_issues`：工具直接确认的问题（origin 通常为 `tool`）。
 - `unverified_issues`：未验证的潜在问题，必须人工确认，不计入确认问题汇总。
 
+## 模型接入与 vLLM
+
+- provider 由 `REPOPILOT_MODEL_PROVIDER` 选择：`stub`（默认，离线确定性）或 `openai` / `vllm`（OpenAI 兼容端点）。
+- 接入 vLLM 只需改配置，无需改代码：
+
+```powershell
+$env:REPOPILOT_MODEL_PROVIDER = "openai"
+$env:REPOPILOT_MODEL_BASE_URL = "http://127.0.0.1:8000/v1"
+$env:REPOPILOT_MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
+$env:REPOPILOT_MODEL_API_KEY = "EMPTY"   # vLLM 默认不校验
+```
+
+- 连通性验证：
+
+```powershell
+.\.venv\Scripts\python.exe -m repopilot.llm.health
+# 退出码：0 可达、2 不可达、3 provider 配置错误；只打印端点元数据，绝不打印 API key
+```
+
+- 模型超时、请求失败、输出截断、服务不可用都会显式失败（`model_unavailable` / `model_output_invalid`），不会降级为「修复成功」；token 用量、请求延迟与任务级推理成本记入任务 `model_usage` 与报告 `repair.usage`。
+
 ## 安全约束（硬性）
 
 - **禁止 shell**：所有子进程使用参数列表调用，代码中不存在 `shell=True`。
@@ -150,15 +214,31 @@ Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/tasks/$($task.task_id)/report"
 | `REPOPILOT_REQUIRE_DEPENDENCY_AUDIT` | `false` | 依赖审计不可用时是否降级为 `needs_review` |
 | `REPOPILOT_KEEP_WORKSPACE` | `true` | 任务结束后是否保留工作区 |
 | `REPOPILOT_SCHEDULER_MAX_WORKERS` | `4` | 后台线程数 |
+| `REPOPILOT_MODEL_PROVIDER` | `stub` | 模型 provider：`stub` / `openai` / `vllm` |
+| `REPOPILOT_MODEL_BASE_URL` | `http://127.0.0.1:8000/v1` | OpenAI 兼容端点 |
+| `REPOPILOT_MODEL_NAME` | `local-model` | 模型名 |
+| `REPOPILOT_MODEL_API_KEY_ENV` | `REPOPILOT_MODEL_API_KEY` | 存放 API key 的环境变量名（值不落盘） |
+| `REPOPILOT_MODEL_TIMEOUT_SECONDS` | `60` | 单次模型请求超时 |
+| `REPOPILOT_MODEL_MAX_TOKENS` | `1024` | 单次生成上限 |
+| `REPOPILOT_MODEL_MAX_RESPONSE_CHARS` | `20000` | 响应长度上限，超出视为截断 |
+| `REPOPILOT_AGENT_MAX_ROUNDS` | `6` | 最大修复轮数 |
+| `REPOPILOT_AGENT_MAX_WALL_SECONDS` | `900` | 修复总时长上限 |
+| `REPOPILOT_AGENT_MAX_MODEL_CALLS` | `12` | 模型调用次数上限 |
+| `REPOPILOT_AGENT_MAX_MODEL_TOKENS` | `60000` | 模型 token 预算 |
+| `REPOPILOT_AGENT_MAX_TOOL_CALLS` | `40` | 工具调用次数上限 |
+| `REPOPILOT_AGENT_MAX_TOOL_OUTPUT_BYTES` | `200000` | 单次工具输出上限 |
+| `REPOPILOT_AGENT_MAX_DIFF_LINES` | `400` | 补丁行数上限 |
+| `REPOPILOT_AGENT_MAX_CHANGED_FILES` | `10` | 补丁文件数上限 |
 
 ## Fixtures 与测试
 
-`fixtures/` 下提供两个受控仓库模板，`scripts/make_fixtures.py` 会将其物化为真实 git 仓库（含基线 commit 与后续 commit，用于验证 commit 固定）：
+`fixtures/` 下提供三个受控仓库模板，`scripts/make_fixtures.py` 会将其物化为真实 git 仓库（含基线 commit 与后续 commit，用于验证 commit 固定）：
 
 | Fixture | 已知可检出问题 |
 |---|---|
 | `py_calc_buggy` | Ruff `F401`/`F821`/`F841`/`E711`/`B006`；1 个失败测试；1 个未固定版本依赖 |
 | `py_lib_clean` | 无 Ruff 问题、测试全绿、含 1 个被跳过的测试（启发式未验证提示） |
+| `py_stats_repair` | `mean` 存在 off-by-one 真实缺陷，`tests/test_stats.py::test_mean_of_values` 基线失败；用于阶段二修复闭环 |
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest              # 全部单元测试 + 端到端测试
@@ -168,9 +248,11 @@ Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/tasks/$($task.task_id)/report"
 
 端到端测试覆盖：`POST /api/tasks` → 轮询至 `succeeded` → `/report` 返回合规问题列表；不可达远端优雅失败（`failed` + `failure_reason`）；非受信来源落到 `needs_review`；取消运行中的任务落到 `cancelled`。
 
+阶段二在 `tests/test_repair_e2e.py` 增加确定性端到端测试（用 stub 模型）：给定 fixture 仓库与明确问题，完成定位 → 补丁 → 测试 → 判定，产出补丁、质量门禁结论与完整执行记录；并覆盖超限终止、作弊补丁拦截、模型不可用/输出不可解析、未受信来源不执行、以及基于已保存状态的续跑。
+
 ## 本迭代明确不做
 
-LLM / vLLM / LangGraph 调用、代码自动修复、任何 GitHub 写操作（分支 / 提交 / PR）、Redis / PostgreSQL / Dify / Milvus、Agentic RL。未引入这些依赖。
+阶段二明确不做：任何 GitHub 写操作（分支 / 提交 / Draft PR）、Redis / PostgreSQL / Dify、Milvus / 向量检索、Agentic RL，以及「自主判断并修复任意仓库的任意问题」。代码执行路径仍默认关闭，仅在受控 fixture 上启用。
 
 ## 目录结构
 
@@ -181,6 +263,8 @@ pyproject.toml                # 依赖、ruff 与 pytest 配置
 docs/open-questions.md        # 设计文档未定义处的决策记录
 fixtures/                     # 受控 fixture 仓库模板
 scripts/make_fixtures.py      # 物化 fixture 为真实 git 仓库
+src/repopilot/agent/          # LangGraph 修复工作流、受控工具集、质量门禁
+src/repopilot/llm/            # 模型抽象（stub / OpenAI 兼容 vLLM 客户端）
 src/repopilot/                # 后端服务与评估流水线
 tests/                        # 单元测试与端到端回归测试
 ```

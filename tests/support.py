@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import difflib
+import json
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -132,3 +134,139 @@ def wait_for_terminal(client, task_id: str, timeout: float = 120.0) -> dict:
             return last
         time.sleep(0.05)
     raise AssertionError(f"task {task_id} did not finish within {timeout}s; last={last}")
+
+
+# --- Phase 2 repair helpers -------------------------------------------------
+
+FIXTURE_TEMPLATE_DIR = Path(__file__).resolve().parents[1] / "fixtures"
+STATS_PATH = "src/statskit/stats.py"
+STATS_TEST_PATH = "tests/test_stats.py"
+STATS_TARGET_TEST = "tests/test_stats.py::test_mean_of_values"
+_REPAIR_FIXTURE = "py_stats_repair"
+
+
+def start_task(client, payload: dict) -> str:
+    """Create a task over the API and return its id (asserting the 202)."""
+
+    response = client.post("/api/tasks", json=payload)
+    assert response.status_code == 202, response.text
+    return response.json()["task_id"]
+
+
+def complete_task(client, payload: dict, timeout: float = 180.0) -> dict:
+    """Create a task and poll until it reaches a terminal status."""
+
+    return wait_for_terminal(client, start_task(client, payload), timeout=timeout)
+
+
+def _unified_diff(old: str, new: str, path: str, *, tofile: str | None = None) -> str:
+    return "".join(
+        difflib.unified_diff(
+            old.splitlines(keepends=True),
+            new.splitlines(keepends=True),
+            fromfile=f"a/{path}",
+            tofile=tofile or f"b/{path}",
+        )
+    )
+
+
+def _stats_template() -> str:
+    return (FIXTURE_TEMPLATE_DIR / _REPAIR_FIXTURE / STATS_PATH).read_text(encoding="utf-8")
+
+
+def _stats_test_template() -> str:
+    return (FIXTURE_TEMPLATE_DIR / _REPAIR_FIXTURE / STATS_TEST_PATH).read_text(encoding="utf-8")
+
+
+def stats_fix_diff() -> str:
+    """The correct one line fix for ``mean``."""
+
+    old = _stats_template()
+    new = old.replace("sum(values) / (len(values) - 1)", "sum(values) / len(values)")
+    assert new != old
+    return _unified_diff(old, new, STATS_PATH)
+
+
+def stats_comment_diff(attempt: int) -> str:
+    """A patch that applies but never fixes the failing test."""
+
+    old = _stats_template()
+    lines = old.splitlines(keepends=True)
+    index = next(i for i, line in enumerate(lines) if line.startswith("def mean("))
+    lines.insert(index, f"# repair attempt {attempt}\n")
+    return _unified_diff(old, "".join(lines), STATS_PATH)
+
+
+def delete_test_file_diff() -> str:
+    """A cheating patch that deletes the failing test file."""
+
+    old = _stats_test_template()
+    return "".join(
+        difflib.unified_diff(
+            old.splitlines(keepends=True),
+            [],
+            fromfile=f"a/{STATS_TEST_PATH}",
+            tofile="/dev/null",
+        )
+    )
+
+
+def weaken_assertion_diff() -> str:
+    """A cheating patch that replaces the failing assertion with ``assert True``."""
+
+    old = _stats_test_template()
+    new = old.replace("    assert mean([1.0, 2.0, 3.0]) == 2.0\n", "    assert True\n")
+    assert new != old
+    return _unified_diff(old, new, STATS_TEST_PATH)
+
+
+def repair_responder(*, patch=None, patch_factory=None, plan=None, diagnosis=None):
+    """Build a phase-aware stub responder for the repair loop."""
+
+    counter = {"patch": 0}
+
+    def responder(request, index):
+        if request.phase == "understand":
+            return json.dumps(
+                plan
+                or {
+                    "goal": "make the failing test pass",
+                    "queries": ["def mean"],
+                    "suspect_paths": [STATS_PATH],
+                }
+            )
+        if request.phase == "locate":
+            return json.dumps(
+                {
+                    "diagnosis": diagnosis
+                    or {
+                        "target_files": [STATS_PATH],
+                        "root_cause": "mean divides by len(values) - 1",
+                        "edit_intent": "divide by len(values)",
+                    }
+                }
+            )
+        if request.phase == "patch":
+            attempt = counter["patch"]
+            counter["patch"] += 1
+            diff = patch_factory(attempt) if patch_factory is not None else (patch or "")
+            return json.dumps({"diff": diff, "notes": f"attempt {attempt}"})
+        return "{}"
+
+    return responder
+
+
+def repair_payload(repo_path, **overrides) -> dict:
+    """Standard repair request body for the stats fixture."""
+
+    payload = {
+        "repo_url": str(repo_path),
+        "mode": "repair",
+        "problem": (
+            "tests/test_stats.py::test_mean_of_values fails: mean([1.0, 2.0, 3.0]) "
+            "returns 3.0 instead of 2.0"
+        ),
+        "target_tests": [STATS_TARGET_TEST],
+    }
+    payload.update(overrides)
+    return payload
