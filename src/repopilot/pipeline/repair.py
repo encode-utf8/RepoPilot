@@ -29,7 +29,7 @@ from repopilot.errors import (
 )
 from repopilot.execution.git import RepoCheckout, is_trusted_source
 from repopilot.execution.git import clone_and_pin_repo as _clone_and_pin_repo
-from repopilot.execution.sandbox import LocalProcessSandboxExecutor
+from repopilot.execution.sandbox import build_sandbox
 from repopilot.execution.test_run import run_pytest
 from repopilot.execution.workspace import Workspace, WorkspaceManager
 from repopilot.llm.base import ModelClient
@@ -47,6 +47,7 @@ from repopilot.models import (
     TerminationReason,
     utcnow,
 )
+from repopilot.pipeline.publish import PullRequestPublisher
 from repopilot.report.builder import build_report, persist_report
 from repopilot.scan.scanner import scan_project
 from repopilot.storage.base import TaskStore
@@ -113,11 +114,15 @@ class RepairRunner:
         store: TaskStore,
         model_client: ModelClient | None = None,
         workspace_manager: WorkspaceManager | None = None,
+        publisher: PullRequestPublisher | None = None,
+        sandbox_factory=None,
     ) -> None:
         self._settings = settings
         self._store = store
         self._model_client = model_client or build_model_client(settings)
         self._workspaces = workspace_manager or WorkspaceManager(settings)
+        self._publisher = publisher
+        self._sandbox_factory = sandbox_factory or build_sandbox
 
     # -- resume helpers --------------------------------------------------------
 
@@ -212,7 +217,9 @@ class RepairRunner:
             this_task.progress = "cloning"
             self._store.save(this_task)
 
-            sandbox = LocalProcessSandboxExecutor(self._settings, workspace, trusted_source=trusted)
+            sandbox = self._sandbox_factory(self._settings, workspace, trusted_source=trusted)
+            this_task.sandbox_isolation = getattr(sandbox, "isolation_kind", None)
+            self._store.save(this_task)
             if not sandbox.code_execution_enabled:
                 raise CodeExecutionDeniedError(
                     "repair requires executing repository tests; this source is not a trusted "
@@ -386,11 +393,6 @@ class RepairRunner:
         )
 
         final = self._store.get(task_id) or base_state
-        final.status = status
-        final.progress = "finished"
-        final.finished_at = utcnow()
-        final.failure_code = failure_code
-        final.failure_reason = failure_reason
         final.report = report
         final.is_trusted_source = trusted
         if runtime is not None:
@@ -401,16 +403,43 @@ class RepairRunner:
             final.resolved_commit = checkout.resolved_commit
         if workspace is not None:
             final.workspace_path = str(workspace.root)
+        # Keep the task non terminal until publishing has finished, so a caller
+        # that polls to a terminal status always observes the complete record.
+        final.progress = "publishing" if self._publisher is not None else "finishing"
         self._store.save(final)
 
-        persist_report(self._settings, report, workspace, filename="repair-report.json")
+        if self._publisher is not None:
+            try:
+                self._publisher.publish_task(task_id, require_terminal=False)
+            except RepoPilotError as exc:  # pragma: no cover - publisher records its own failures
+                logger.event("pr.failed", exc.failure_reason(), level="error", code=exc.code)
+
+        final = self._store.get(task_id) or final
+        # A publish failure downgrades the task (for example to needs_review);
+        # keep that verdict rather than overwriting it with the repair status.
+        if final.status in {TaskStatus.failed, TaskStatus.needs_review}:
+            status = final.status
+            failure_code = final.failure_code
+            failure_reason = final.failure_reason
+        final.status = status
+        final.progress = "finished"
+        final.finished_at = utcnow()
+        final.failure_code = failure_code
+        final.failure_reason = failure_reason
+        final.report = final.report if final.report is not None else report
+        self._store.save(final)
+
+        persisted_report = final.report if final.report is not None else report
+        persist_report(self._settings, persisted_report, workspace, filename="repair-report.json")
         logger.event(
             "task.finished",
-            f"repair finished with status {status.value}",
-            status=status.value,
+            f"repair finished with status {final.status.value}",
+            status=final.status.value,
             result=(outcome.result if outcome else result),
-            termination_reason=failure_code,
+            termination_reason=final.failure_code,
             gate_passed=outcome.quality_gate.passed if outcome else None,
+            publish_status=(persisted_report.publish.status if persisted_report.publish else None),
+            pull_request=(final.pull_request.url if final.pull_request else None),
             usage=(runtime.usage.model_dump() if runtime else None),
         )
         if workspace is not None:

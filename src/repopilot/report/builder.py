@@ -16,6 +16,7 @@ from repopilot.models import (
     CheckerStatus,
     Issue,
     ProjectProfile,
+    PublishOutcome,
     RepairOutcome,
     RepoMetadata,
     Report,
@@ -63,6 +64,7 @@ def build_report(
     failure_reason: str | None = None,
     notes: list[str] | None = None,
     repair: RepairOutcome | None = None,
+    publish: PublishOutcome | None = None,
 ) -> Report:
     """Assemble a fully populated, self describing report."""
 
@@ -131,6 +133,7 @@ def build_report(
         summary=summary,
         verification=verification,
         repair=repair,
+        publish=publish,
         failure_code=failure_code,
         failure_reason=failure_reason,
         notes=report_notes,

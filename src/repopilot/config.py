@@ -152,6 +152,42 @@ class Settings:
     agent_max_search_results: int = 40
     agent_max_file_bytes: int = 200_000
 
+    # --- Phase 3: GitHub publishing ---
+
+    #: Master switch. When false no task ever performs a remote write.
+    enable_github_publish: bool = False
+    #: Environment variable holding the GitHub token. Only the *name* is stored on
+    #: settings; the credential provider reads the value at write time.
+    github_token_env: str = "REPOPILOT_GITHUB_TOKEN"
+    github_api_base_url: str = "https://api.github.com"
+    github_api_timeout_seconds: float = 30.0
+    github_max_response_bytes: int = 1_000_000
+    #: ``owner/name`` override for local mirrors and fixtures; when empty the slug
+    #: is parsed from the repository URL.
+    github_repo_slug: str | None = None
+    #: Base branch used for the Draft PR when the repository default is unknown.
+    github_base_branch: str = "main"
+    github_branch_prefix: str = "repopilot/fix-"
+    github_commit_author_name: str = "RepoPilot Bot"
+    github_commit_author_email: str = "repopilot-bot@users.noreply.github.com"
+    github_max_changed_files: int = 50
+    github_max_commit_bytes: int = 2_000_000
+
+    # --- Phase 3: sandbox isolation (required before remote writes) ---
+
+    #: ``local`` is the hardened local process runner; ``container`` uses Docker.
+    sandbox_backend: str = "local"
+    #: Refuse to publish unless code execution ran inside a container.
+    publish_requires_container: bool = True
+    docker_executable: str = "docker"
+    docker_image: str = "python:3.11-slim"
+    container_memory: str = "1g"
+    container_cpus: str = "1.0"
+    container_pids_limit: int = 256
+    container_user: str = "1000:1000"
+    container_tmp_size: str = "256m"
+    container_timeout_seconds: float = 600.0
+
 
 def load_settings(**overrides: object) -> Settings:
     """Build :class:`Settings` from the environment, then apply explicit overrides."""
@@ -209,6 +245,31 @@ def load_settings(**overrides: object) -> Settings:
         agent_max_context_files=_env_int("REPOPILOT_AGENT_MAX_CONTEXT_FILES", 6),
         agent_max_search_results=_env_int("REPOPILOT_AGENT_MAX_SEARCH_RESULTS", 40),
         agent_max_file_bytes=_env_int("REPOPILOT_AGENT_MAX_FILE_BYTES", 200_000),
+        enable_github_publish=_env_flag("REPOPILOT_ENABLE_GITHUB_PUBLISH", False),
+        github_token_env=env.get("REPOPILOT_GITHUB_TOKEN_ENV", "REPOPILOT_GITHUB_TOKEN"),
+        github_api_base_url=env.get("REPOPILOT_GITHUB_API_BASE_URL", "https://api.github.com"),
+        github_api_timeout_seconds=_env_float("REPOPILOT_GITHUB_API_TIMEOUT_SECONDS", 30.0),
+        github_max_response_bytes=_env_int("REPOPILOT_GITHUB_MAX_RESPONSE_BYTES", 1_000_000),
+        github_repo_slug=(env.get("REPOPILOT_GITHUB_REPO_SLUG") or "").strip() or None,
+        github_base_branch=env.get("REPOPILOT_GITHUB_BASE_BRANCH", "main"),
+        github_branch_prefix=env.get("REPOPILOT_GITHUB_BRANCH_PREFIX", "repopilot/fix-"),
+        github_commit_author_name=env.get("REPOPILOT_GITHUB_COMMIT_AUTHOR_NAME", "RepoPilot Bot"),
+        github_commit_author_email=env.get(
+            "REPOPILOT_GITHUB_COMMIT_AUTHOR_EMAIL",
+            "repopilot-bot@users.noreply.github.com",
+        ),
+        github_max_changed_files=_env_int("REPOPILOT_GITHUB_MAX_CHANGED_FILES", 50),
+        github_max_commit_bytes=_env_int("REPOPILOT_GITHUB_MAX_COMMIT_BYTES", 2_000_000),
+        sandbox_backend=env.get("REPOPILOT_SANDBOX_BACKEND", "local"),
+        publish_requires_container=_env_flag("REPOPILOT_PUBLISH_REQUIRES_CONTAINER", True),
+        docker_executable=env.get("REPOPILOT_DOCKER_EXECUTABLE", "docker"),
+        docker_image=env.get("REPOPILOT_DOCKER_IMAGE", "python:3.11-slim"),
+        container_memory=env.get("REPOPILOT_CONTAINER_MEMORY", "1g"),
+        container_cpus=env.get("REPOPILOT_CONTAINER_CPUS", "1.0"),
+        container_pids_limit=_env_int("REPOPILOT_CONTAINER_PIDS_LIMIT", 256),
+        container_user=env.get("REPOPILOT_CONTAINER_USER", "1000:1000"),
+        container_tmp_size=env.get("REPOPILOT_CONTAINER_TMP_SIZE", "256m"),
+        container_timeout_seconds=_env_float("REPOPILOT_CONTAINER_TIMEOUT_SECONDS", 600.0),
     )
     if not overrides:
         return settings

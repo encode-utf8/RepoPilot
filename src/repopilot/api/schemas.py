@@ -7,7 +7,14 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from repopilot.models import ModelUsage, ReportSummary, Task, TaskRequest, TaskStatus
+from repopilot.models import (
+    ModelUsage,
+    PullRequestInfo,
+    ReportSummary,
+    Task,
+    TaskRequest,
+    TaskStatus,
+)
 
 
 class CreateTaskRequest(BaseModel):
@@ -101,6 +108,8 @@ class TaskView(BaseModel):
     termination_reason: str | None = None
     resumed_from: str | None = None
     model_usage: ModelUsage | None = None
+    sandbox_isolation: str | None = None
+    pull_request: PullRequestInfo | None = None
 
     @classmethod
     def from_task(cls, task: Task) -> TaskView:
@@ -126,6 +135,8 @@ class TaskView(BaseModel):
             termination_reason=task.termination_reason,
             resumed_from=task.resumed_from,
             model_usage=task.model_usage,
+            sandbox_isolation=task.sandbox_isolation,
+            pull_request=task.pull_request,
         )
 
 

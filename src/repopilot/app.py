@@ -14,10 +14,14 @@ from repopilot.api.routes import router as api_router
 from repopilot.cancellation import CancellationToken
 from repopilot.checkers.base import Checker
 from repopilot.config import Settings, load_settings
+from repopilot.credentials import EnvCredentialProvider, GitHubCredentialProvider
 from repopilot.errors import InvalidRequestError
+from repopilot.github.base import GitHubClient
+from repopilot.github.rest import RestGitHubClient
 from repopilot.ids import new_run_id, new_task_id
 from repopilot.llm.base import ModelClient
 from repopilot.pipeline.evaluate import AssessmentRunner
+from repopilot.pipeline.publish import PullRequestPublisher
 from repopilot.pipeline.repair import RepairRunner
 from repopilot.scheduler.base import TaskScheduler
 from repopilot.scheduler.thread_pool import ThreadPoolTaskScheduler
@@ -35,6 +39,7 @@ class AppContext:
     runner: AssessmentRunner
     repair_runner: RepairRunner | None = None
     model_client: ModelClient | None = None
+    publisher: PullRequestPublisher | None = None
     task_id_factory: Callable[[], str] = field(default=new_task_id)
     run_id_factory: Callable[[], str] = field(default=new_run_id)
 
@@ -67,6 +72,10 @@ def create_app(
     runner: AssessmentRunner | None = None,
     model_client: ModelClient | None = None,
     repair_runner: RepairRunner | None = None,
+    github_client: GitHubClient | None = None,
+    credential_provider: GitHubCredentialProvider | None = None,
+    publisher: PullRequestPublisher | None = None,
+    sandbox_factory=None,
 ) -> FastAPI:
     """Create the FastAPI application.
 
@@ -82,8 +91,19 @@ def create_app(
     resolved_runner = runner or AssessmentRunner(
         settings=resolved_settings, store=resolved_store, checkers=checkers
     )
+    resolved_provider = credential_provider or EnvCredentialProvider(resolved_settings)
+    resolved_github = github_client
+    if resolved_github is None and resolved_settings.enable_github_publish:
+        resolved_github = RestGitHubClient(resolved_settings, provider=resolved_provider)
+    resolved_publisher = publisher or PullRequestPublisher(
+        settings=resolved_settings, store=resolved_store, client=resolved_github
+    )
     resolved_repair_runner = repair_runner or RepairRunner(
-        settings=resolved_settings, store=resolved_store, model_client=model_client
+        settings=resolved_settings,
+        store=resolved_store,
+        model_client=model_client,
+        publisher=resolved_publisher,
+        sandbox_factory=sandbox_factory,
     )
     context = AppContext(
         settings=resolved_settings,
@@ -92,6 +112,7 @@ def create_app(
         runner=resolved_runner,
         repair_runner=resolved_repair_runner,
         model_client=model_client,
+        publisher=resolved_publisher,
     )
 
     @asynccontextmanager
