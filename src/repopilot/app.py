@@ -14,8 +14,11 @@ from repopilot.api.routes import router as api_router
 from repopilot.cancellation import CancellationToken
 from repopilot.checkers.base import Checker
 from repopilot.config import Settings, load_settings
+from repopilot.errors import InvalidRequestError
 from repopilot.ids import new_run_id, new_task_id
+from repopilot.llm.base import ModelClient
 from repopilot.pipeline.evaluate import AssessmentRunner
+from repopilot.pipeline.repair import RepairRunner
 from repopilot.scheduler.base import TaskScheduler
 from repopilot.scheduler.thread_pool import ThreadPoolTaskScheduler
 from repopilot.storage.base import TaskStore
@@ -30,14 +33,27 @@ class AppContext:
     store: TaskStore
     scheduler: TaskScheduler
     runner: AssessmentRunner
+    repair_runner: RepairRunner | None = None
+    model_client: ModelClient | None = None
     task_id_factory: Callable[[], str] = field(default=new_task_id)
     run_id_factory: Callable[[], str] = field(default=new_run_id)
 
-    def submit(self, task_id: str):
+    def runner_for(self, mode: str):
+        """Return the pipeline that handles ``mode`` or raise a 400-mapped error."""
+
+        if mode == "repair":
+            if self.repair_runner is None:
+                raise InvalidRequestError("repair mode is not configured on this server")
+            return self.repair_runner
+        return self.runner
+
+    def submit(self, task_id: str, runner=None):
         """Return the callable the scheduler executes for ``task_id``."""
 
+        resolved = runner or self.runner
+
         def _run(token: CancellationToken) -> None:
-            self.runner.run(task_id, token)
+            resolved.run(task_id, token)
 
         return _run
 
@@ -49,6 +65,8 @@ def create_app(
     scheduler: TaskScheduler | None = None,
     checkers: list[Checker] | None = None,
     runner: AssessmentRunner | None = None,
+    model_client: ModelClient | None = None,
+    repair_runner: RepairRunner | None = None,
 ) -> FastAPI:
     """Create the FastAPI application.
 
@@ -64,11 +82,16 @@ def create_app(
     resolved_runner = runner or AssessmentRunner(
         settings=resolved_settings, store=resolved_store, checkers=checkers
     )
+    resolved_repair_runner = repair_runner or RepairRunner(
+        settings=resolved_settings, store=resolved_store, model_client=model_client
+    )
     context = AppContext(
         settings=resolved_settings,
         store=resolved_store,
         scheduler=resolved_scheduler,
         runner=resolved_runner,
+        repair_runner=resolved_repair_runner,
+        model_client=model_client,
     )
 
     @asynccontextmanager

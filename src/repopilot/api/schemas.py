@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from repopilot.models import ReportSummary, Task, TaskRequest, TaskStatus
+from repopilot.models import ModelUsage, ReportSummary, Task, TaskRequest, TaskStatus
 
 
 class CreateTaskRequest(BaseModel):
@@ -21,6 +22,23 @@ class CreateTaskRequest(BaseModel):
     base_commit: str | None = Field(
         default=None, description="Exact commit to pin; takes precedence over base_branch."
     )
+    mode: Literal["assess", "repair"] = Field(
+        default="assess", description="assess runs the checkers; repair runs the agent loop."
+    )
+    problem: str | None = Field(
+        default=None, description="Required for repair tasks: the problem to fix."
+    )
+    target_tests: list[str] = Field(
+        default_factory=list,
+        description="Optional pytest node ids that must pass after the repair.",
+    )
+    allowed_paths: list[str] = Field(
+        default_factory=list,
+        description="Optional extra paths the repair patch is allowed to touch.",
+    )
+    resume_task_id: str | None = Field(
+        default=None, description="Continue a previous repair run from its saved state."
+    )
 
     @field_validator("repo_url")
     @classmethod
@@ -30,11 +48,23 @@ class CreateTaskRequest(BaseModel):
             raise ValueError(msg)
         return value.strip()
 
+    @model_validator(mode="after")
+    def _repair_requires_problem(self) -> CreateTaskRequest:
+        if self.mode == "repair" and not (self.problem or "").strip():
+            msg = "problem is required when mode is 'repair'"
+            raise ValueError(msg)
+        return self
+
     def to_task_request(self) -> TaskRequest:
         return TaskRequest(
             repo_url=self.repo_url,
             base_branch=self.base_branch,
             base_commit=self.base_commit,
+            mode=self.mode,
+            problem=self.problem,
+            target_tests=list(self.target_tests),
+            allowed_paths=list(self.allowed_paths),
+            resume_task_id=self.resume_task_id,
         )
 
 
@@ -67,6 +97,10 @@ class TaskView(BaseModel):
     workspace_path: str | None = None
     report_available: bool = False
     summary: ReportSummary | None = None
+    rounds: int = 0
+    termination_reason: str | None = None
+    resumed_from: str | None = None
+    model_usage: ModelUsage | None = None
 
     @classmethod
     def from_task(cls, task: Task) -> TaskView:
@@ -88,6 +122,10 @@ class TaskView(BaseModel):
             workspace_path=task.workspace_path,
             report_available=task.report is not None,
             summary=task.report.summary if task.report is not None else None,
+            rounds=task.rounds,
+            termination_reason=task.termination_reason,
+            resumed_from=task.resumed_from,
+            model_usage=task.model_usage,
         )
 
 

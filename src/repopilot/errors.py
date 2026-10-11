@@ -62,3 +62,49 @@ class CommandTimeoutError(RepoPilotError):
 
 class CheckerError(RepoPilotError):
     code = "checker_error"
+
+
+class ToolError(RepoPilotError):
+    """A controlled agent tool rejected its input or could not complete."""
+
+    code = "tool_error"
+
+
+class PatchApplyError(ToolError):
+    code = "patch_apply_failed"
+
+
+class ModelError(RepoPilotError):
+    """Base class for model client failures."""
+
+    code = "model_error"
+
+
+class ModelUnavailableError(ModelError):
+    """The model endpoint is unreachable, timed out or returned a server error."""
+
+    code = "model_unavailable"
+
+
+class ModelRequestError(ModelError):
+    """The model endpoint rejected the request (bad request, auth, rate limit)."""
+
+    code = "model_request_failed"
+
+
+class ModelOutputError(ModelError):
+    """The model answered, but the answer could not be used as specified."""
+
+    code = "model_output_invalid"
+
+
+class ModelBudgetExceededError(ModelError):
+    """A model call would exceed the per task call or token budget."""
+
+    code = "model_budget_exceeded"
+
+
+class TestsUnavailableError(RepoPilotError):
+    """The baseline test run could not be executed or parsed."""
+
+    code = "tests_unavailable"

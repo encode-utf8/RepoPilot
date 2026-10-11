@@ -135,13 +135,26 @@ class TaskRequest(BaseModel):
     repo_url: str
     base_branch: str | None = None
     base_commit: str | None = None
-    mode: Literal["assess"] = "assess"
+    mode: Literal["assess", "repair"] = "assess"
+    #: Free form problem statement for ``repair`` tasks (Issue text, CI failure,
+    #: or an assessment finding). Required when ``mode == "repair"``.
+    problem: str | None = None
+    #: Optional explicit target test node ids; when empty the gate treats the
+    #: tests that fail on the pinned baseline as the targets.
+    target_tests: list[str] = Field(default_factory=list)
+    #: Optional extra paths the patch is allowed to touch.
+    allowed_paths: list[str] = Field(default_factory=list)
+    #: Continue a previous repair run instead of starting from scratch.
+    resume_task_id: str | None = None
 
-    def dedupe_key(self) -> tuple[str, str, str]:
+    def dedupe_key(self) -> tuple[str, ...]:
         return (
             self.repo_url.rstrip("/"),
             (self.base_branch or "").strip(),
             (self.base_commit or "").strip(),
+            self.mode,
+            (self.problem or "").strip(),
+            ",".join(sorted(self.target_tests)),
         )
 
 
@@ -230,9 +243,211 @@ class Report(BaseModel):
     unverified_issues: list[Issue] = Field(default_factory=list)
     summary: ReportSummary = Field(default_factory=ReportSummary)
     verification: VerificationInfo
+    repair: RepairOutcome | None = None
     failure_code: str | None = None
     failure_reason: str | None = None
     notes: list[str] = Field(default_factory=list)
+
+
+class TaskMode(StrEnum):
+    assess = "assess"
+    repair = "repair"
+
+
+class TerminationReason(StrEnum):
+    """Why the finite repair loop stopped."""
+
+    completed = "completed"
+    gate_failed = "gate_failed"
+    limit_max_rounds = "limit_max_rounds"
+    limit_wall_clock = "limit_wall_clock"
+    limit_model_calls = "limit_model_calls"
+    limit_model_tokens = "limit_model_tokens"
+    limit_tool_calls = "limit_tool_calls"
+    no_progress = "no_progress"
+    model_unavailable = "model_unavailable"
+    model_output_invalid = "model_output_invalid"
+    tests_unavailable = "tests_unavailable"
+    cancelled = "cancelled"
+    unexpected_error = "unexpected_error"
+
+
+class ModelCallUsage(BaseModel):
+    """Per call accounting of a single model request."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    index: int
+    phase: str
+    model: str = ""
+    ok: bool = True
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    latency_ms: int = 0
+    finish_reason: str | None = None
+    truncated: bool = False
+    cost_usd: float = 0.0
+    error_code: str | None = None
+    error: str | None = None
+
+
+class ModelUsage(BaseModel):
+    """Task level aggregation of calls, latency and inference cost."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider: str = ""
+    model: str = ""
+    calls: int = 0
+    failed_calls: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    latency_ms: int = 0
+    cost_usd: float = 0.0
+    per_phase: dict[str, int] = Field(default_factory=dict)
+
+    def record(self, call: ModelCallUsage) -> None:
+        self.calls += 1
+        if not call.ok:
+            self.failed_calls += 1
+        self.prompt_tokens += call.prompt_tokens
+        self.completion_tokens += call.completion_tokens
+        self.total_tokens += call.total_tokens
+        self.latency_ms += call.latency_ms
+        self.cost_usd = round(self.cost_usd + call.cost_usd, 8)
+        self.per_phase[call.phase] = self.per_phase.get(call.phase, 0) + 1
+
+
+class ToolInvocation(BaseModel):
+    """Record of one controlled tool call, bounded and redacted."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    index: int
+    round: int
+    tool: str
+    ok: bool
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    output_excerpt: str = ""
+    output_bytes: int = 0
+    truncated: bool = False
+    duration_ms: int = 0
+    error_code: str | None = None
+    error: str | None = None
+    data: dict[str, Any] = Field(default_factory=dict)
+
+
+class TestCaseOutcome(BaseModel):
+    """Single pytest case outcome."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    nodeid: str
+    outcome: Literal["passed", "failed", "error", "skipped"]
+    detail: str | None = None
+
+
+class TestSnapshot(BaseModel):
+    """Outcome of one pytest run, used to compare baseline and final state."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ran: bool = False
+    command: list[str] = Field(default_factory=list)
+    total: int = 0
+    passed: int = 0
+    failed: int = 0
+    errors: int = 0
+    skipped: int = 0
+    duration_ms: int = 0
+    exit_code: int | None = None
+    error: str | None = None
+    cases: list[TestCaseOutcome] = Field(default_factory=list)
+
+    def outcome_map(self) -> dict[str, str]:
+        return {case.nodeid: case.outcome for case in self.cases}
+
+    def failing(self) -> list[str]:
+        return [case.nodeid for case in self.cases if case.outcome in ("failed", "error")]
+
+    def passing(self) -> list[str]:
+        return [case.nodeid for case in self.cases if case.outcome == "passed"]
+
+
+class GateCheck(BaseModel):
+    """One quality gate assertion and its verdict."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    passed: bool
+    detail: str = ""
+
+
+class QualityGateReport(BaseModel):
+    """Design document 3.6 quality gate verdict."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    passed: bool = False
+    primary_blocker: str | None = None
+    checks: list[GateCheck] = Field(default_factory=list)
+    blockers: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    cheating_findings: list[str] = Field(default_factory=list)
+
+
+class PatchArtifact(BaseModel):
+    """The candidate patch produced by the agent."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    applied: bool = False
+    diff: str = ""
+    changed_files: list[str] = Field(default_factory=list)
+    added_lines: int = 0
+    removed_lines: int = 0
+    diff_lines: int = 0
+    diff_hash: str | None = None
+
+
+class RepairRound(BaseModel):
+    """Everything recorded for one iteration of the repair loop."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    index: int
+    phase: str
+    summary: str = ""
+    model_calls: list[ModelCallUsage] = Field(default_factory=list)
+    tool_calls: list[ToolInvocation] = Field(default_factory=list)
+    patch_hash: str | None = None
+    tests: TestSnapshot | None = None
+    notes: list[str] = Field(default_factory=list)
+    termination_reason: TerminationReason | None = None
+
+
+class RepairOutcome(BaseModel):
+    """Repair result attached to the unified :class:`Report`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: TaskMode = TaskMode.repair
+    termination_reason: TerminationReason
+    result: Literal["fixed", "not_fixed", "needs_review", "failed"] = "not_fixed"
+    attempts: int = 0
+    max_rounds: int = 0
+    patch: PatchArtifact | None = None
+    quality_gate: QualityGateReport = Field(default_factory=QualityGateReport)
+    usage: ModelUsage = Field(default_factory=ModelUsage)
+    baseline_tests: TestSnapshot | None = None
+    final_tests: TestSnapshot | None = None
+    target_tests: list[str] = Field(default_factory=list)
+    located_files: list[str] = Field(default_factory=list)
+    rounds: list[RepairRound] = Field(default_factory=list)
+    state_path: str | None = None
 
 
 class Task(BaseModel):
@@ -256,6 +471,10 @@ class Task(BaseModel):
     failure_reason: str | None = None
     workspace_path: str | None = None
     report: Report | None = None
+    model_usage: ModelUsage | None = None
+    termination_reason: str | None = None
+    rounds: int = 0
+    resumed_from: str | None = None
 
     @property
     def is_terminal(self) -> bool:

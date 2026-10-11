@@ -44,7 +44,7 @@ class InMemoryTaskStore:
         with self._lock:
             return [self._tasks[key].model_copy(deep=True) for key in reversed(self._order)]
 
-    def find_active_by_key(self, key: tuple[str, str, str]) -> Task | None:
+    def find_active_by_key(self, key: tuple[str, ...]) -> Task | None:
         with self._lock:
             for task in self._tasks.values():
                 if task.status in TERMINAL_TASK_STATUSES:

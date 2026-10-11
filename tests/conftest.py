@@ -41,3 +41,10 @@ def buggy_repo(trusted_root: Path) -> FixtureRepo:
 @pytest.fixture
 def clean_repo(trusted_root: Path) -> FixtureRepo:
     return materialise_fixture("py_lib_clean", trusted_root)
+
+
+@pytest.fixture
+def repair_repo(trusted_root: Path) -> FixtureRepo:
+    """Fixture with one genuine bug plus a failing test (phase 2 repair loop)."""
+
+    return materialise_fixture("py_stats_repair", trusted_root)

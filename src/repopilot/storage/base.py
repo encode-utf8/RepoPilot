@@ -26,5 +26,5 @@ class TaskStore(Protocol):
     def list(self) -> list[Task]:
         """Return all known tasks, newest first."""
 
-    def find_active_by_key(self, key: tuple[str, str, str]) -> Task | None:
+    def find_active_by_key(self, key: tuple[str, ...]) -> Task | None:
         """Return a non terminal task matching the request dedupe key."""
