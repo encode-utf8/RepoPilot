@@ -188,6 +188,33 @@ class Settings:
     container_tmp_size: str = "256m"
     container_timeout_seconds: float = 600.0
 
+    # --- Phase 4: asynchronous task management ---
+
+    #: ``thread`` keeps the in-process thread pool (single node). ``queue`` pushes
+    #: task ids onto a durable queue consumed by one or more workers.
+    scheduler_backend: str = "thread"
+    #: Queue implementation used when ``scheduler_backend == "queue"``.
+    queue_backend: str = "memory"
+    #: `memory` is process-local; `redis` makes locks span workers.
+    lock_backend: str = "memory"
+    redis_url: str = "redis://127.0.0.1:6379/0"
+    redis_key_prefix: str = "repopilot:"
+    #: ``memory`` keeps tasks in-process; ``postgres`` persists them.
+    task_store_backend: str = "memory"
+    postgres_dsn: str = "postgresql://repopilot:repopilot@127.0.0.1:5432/repopilot"
+    #: Run a worker inside the API process as well (handy for a single node).
+    worker_enabled: bool = False
+    worker_poll_timeout_seconds: float = 1.0
+    #: Converge tasks left ``running`` by a crashed worker on startup.
+    reconcile_running_on_startup: bool = True
+    reconcile_pending_on_startup: bool = False
+    #: TTL for the distributed publish lock (must exceed the longest publish).
+    publish_lock_ttl_seconds: float = 600.0
+    #: TTL for the de-duplication lock around task creation.
+    dedupe_lock_ttl_seconds: float = 30.0
+    #: Mount the Dify adapter endpoints. Off by default so Dify is never required.
+    enable_dify: bool = False
+
 
 def load_settings(**overrides: object) -> Settings:
     """Build :class:`Settings` from the environment, then apply explicit overrides."""
@@ -270,6 +297,23 @@ def load_settings(**overrides: object) -> Settings:
         container_user=env.get("REPOPILOT_CONTAINER_USER", "1000:1000"),
         container_tmp_size=env.get("REPOPILOT_CONTAINER_TMP_SIZE", "256m"),
         container_timeout_seconds=_env_float("REPOPILOT_CONTAINER_TIMEOUT_SECONDS", 600.0),
+        scheduler_backend=env.get("REPOPILOT_SCHEDULER_BACKEND", "thread"),
+        queue_backend=env.get("REPOPILOT_QUEUE_BACKEND", "memory"),
+        lock_backend=env.get("REPOPILOT_LOCK_BACKEND", "memory"),
+        redis_url=env.get("REPOPILOT_REDIS_URL", "redis://127.0.0.1:6379/0"),
+        redis_key_prefix=env.get("REPOPILOT_REDIS_KEY_PREFIX", "repopilot:"),
+        task_store_backend=env.get("REPOPILOT_TASK_STORE_BACKEND", "memory"),
+        postgres_dsn=env.get(
+            "REPOPILOT_POSTGRES_DSN",
+            "postgresql://repopilot:repopilot@127.0.0.1:5432/repopilot",
+        ),
+        worker_enabled=_env_flag("REPOPILOT_WORKER_ENABLED", False),
+        worker_poll_timeout_seconds=_env_float("REPOPILOT_WORKER_POLL_TIMEOUT_SECONDS", 1.0),
+        reconcile_running_on_startup=_env_flag("REPOPILOT_RECONCILE_RUNNING_ON_STARTUP", True),
+        reconcile_pending_on_startup=_env_flag("REPOPILOT_RECONCILE_PENDING_ON_STARTUP", False),
+        publish_lock_ttl_seconds=_env_float("REPOPILOT_PUBLISH_LOCK_TTL_SECONDS", 600.0),
+        dedupe_lock_ttl_seconds=_env_float("REPOPILOT_DEDUPE_LOCK_TTL_SECONDS", 30.0),
+        enable_dify=_env_flag("REPOPILOT_ENABLE_DIFY", False),
     )
     if not overrides:
         return settings

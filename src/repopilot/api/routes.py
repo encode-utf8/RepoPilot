@@ -10,6 +10,7 @@ from repopilot.api.schemas import (
     CreateTaskRequest,
     CreateTaskResponse,
     LogResponse,
+    TaskUsageView,
     TaskView,
 )
 from repopilot.errors import (
@@ -26,7 +27,6 @@ from repopilot.models import (
     Report,
     Task,
     TaskStatus,
-    utcnow,
 )
 
 router = APIRouter(prefix="/api", tags=["tasks"])
@@ -48,32 +48,68 @@ def _load_task(context, task_id: str) -> Task:
     return task
 
 
+def _service(context):
+    """Return the task service or fail loudly when the app was misconfigured."""
+
+    service = getattr(context, "service", None)
+    if service is None:  # pragma: no cover - defensive
+        raise InvalidRequestError("task service is not configured on this server")
+    return service
+
+
 @router.post("/tasks", status_code=status.HTTP_202_ACCEPTED, response_model=CreateTaskResponse)
 def create_task(payload: CreateTaskRequest, context=Depends(get_context)) -> CreateTaskResponse:
-    """Create an assessment or repair task and start it in the background."""
+    """Create an assessment or repair task and enqueue it in the background."""
 
     task_request = payload.to_task_request()
-    runner = context.runner_for(task_request.mode)
-    existing = context.store.find_active_by_key(task_request.dedupe_key())
-    if existing is not None:
-        return CreateTaskResponse(
-            task_id=existing.task_id,
-            run_id=existing.run_id,
-            status=existing.status,
-            deduplicated=True,
-        )
-
-    task = Task(
-        task_id=context.task_id_factory(),
-        run_id=context.run_id_factory(),
-        status=TaskStatus.pending,
-        request=task_request,
-        created_at=utcnow(),
-        updated_at=utcnow(),
+    # Validate the mode up front so an unsupported mode is a 400, not a task that
+    # is created only to fail dispatch later.
+    context.runner_for(task_request.mode)
+    stored, deduplicated = _service(context).submit(task_request)
+    return CreateTaskResponse(
+        task_id=stored.task_id,
+        run_id=stored.run_id,
+        status=stored.status,
+        deduplicated=deduplicated,
     )
-    stored = context.store.create(task)
-    context.scheduler.submit(stored.task_id, context.submit(stored.task_id, runner))
-    return CreateTaskResponse(task_id=stored.task_id, run_id=stored.run_id, status=stored.status)
+
+
+@router.get("/tasks", response_model=list[TaskView])
+def list_tasks(
+    status_filter: TaskStatus | None = Query(default=None, alias="status"),
+    limit: int = Query(default=100, ge=1, le=1000),
+    context=Depends(get_context),
+) -> list[TaskView]:
+    """List known tasks (newest first) with an optional status filter."""
+
+    tasks = context.store.list()
+    if status_filter is not None:
+        tasks = [task for task in tasks if task.status is status_filter]
+    return [TaskView.from_task(task) for task in tasks[:limit]]
+
+
+@router.post(
+    "/tasks/{task_id}/retry",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=CreateTaskResponse,
+)
+def retry_task(task_id: str, context=Depends(get_context)) -> CreateTaskResponse:
+    """Re-run a finished task as a fresh task; 409 while it is still active."""
+
+    stored, deduplicated = _service(context).retry(task_id)
+    return CreateTaskResponse(
+        task_id=stored.task_id,
+        run_id=stored.run_id,
+        status=stored.status,
+        deduplicated=deduplicated,
+    )
+
+
+@router.get("/tasks/{task_id}/usage", response_model=TaskUsageView)
+def get_usage(task_id: str, context=Depends(get_context)) -> TaskUsageView:
+    """Return the resource and progress view for a task."""
+
+    return TaskUsageView.from_task(_load_task(context, task_id), context.settings)
 
 
 @router.get("/tasks/{task_id}", response_model=TaskView)

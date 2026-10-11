@@ -9,6 +9,7 @@
 - **当前处理**：`InMemoryTaskStore`（进程内、带锁、深拷贝隔离）。任务与报告随进程退出而丢失。
 - **影响**：重启后无法查询历史任务；多进程部署（多 worker）无法共享状态，因此阶段一必须以单进程运行。
 - **建议**：阶段四实现 `TaskStore` 协议的 PostgreSQL 版本，并把报告 JSON 一并持久化。
+> **阶段四更新（已完成）**：`PostgresTaskStore`（`src/repopilot/storage/postgres.py`）实现该协议，整个 `Task`（含报告与 PR 元数据）以 JSONB 持久化，顶层列与索引用于运维查询；`REPOPILOT_TASK_STORE_BACKEND=postgres` 切换。
 
 ## 2. 任务调度
 
@@ -16,6 +17,7 @@
 - **当前处理**：`ThreadPoolTaskScheduler`（线程池 + 协作式取消令牌），API 立即返回 `task_id`。
 - **影响**：任务并发受 `REPOPILOT_SCHEDULER_MAX_WORKERS` 限制；无跨进程排队、无重试与优先级。
 - **建议**：阶段四实现基于 Redis 的 `TaskScheduler`，保持协议不变。
+> **阶段四更新（已完成）**：`QueueTaskScheduler` + `RedisTaskQueue`（`src/repopilot/queue/`）实现该协议，接口不变；`python -m repopilot.worker` 为独立消费进程，可横向扩展。
 
 ## 3. 沙箱隔离强度
 
@@ -191,6 +193,7 @@
 - **当前处理**：分支名由 `task_id` 确定性推导；发布前先 `find_pull_request` 复用，`create_ref` 冲突即失败（`github_conflict`）；重放同一任务时按 `task.pull_request` 直接复用，不发起任何远端调用。
 - **影响**：单进程内可安全重入；多 worker 并发发布同一任务可能以冲突收场（不会产生重复 PR，但会落到 `needs_review`）。
 - **建议**：阶段四引入持久化存储后，为发布步骤加分布式锁或「先占位状态」的乐观并发控制。
+> **阶段四更新（已完成）**：`PullRequestPublisher` 用 `LockManager`（`RedisLockManager` / `InMemoryLockManager`）的 `publish:<task_id>` 锁串行化发布；未获锁返回 `publish_in_progress` 且不写状态。任务级去重用 `dedupe:<sha1>` 锁保护「查重 → 插入」。详见下方 #31–#37。
 
 ## 28. Draft PR 描述模板与本地化
 
@@ -213,3 +216,56 @@
 - **影响**：无 Docker 的环境默认无法发布 Draft PR；这是有意的安全默认。
 - **建议**：评估 rootless 容器（podman）或远程隔离执行器，作为 `SandboxExecutor` 的另一种实现。
 
+
+## 31. 队列可靠性（消息确认与重投）
+
+- **问题**：Redis 队列用 `BLPOP` 取任务，取出即从 list 移除；worker 在取走之后、`complete` 之前被杀，该 `task_id` 会丢失。
+- **当前处理**：用 `running` 集合记录在途任务；启动恢复只收敛「存储里处于 running」的任务。若 worker 在 pop 之后、标记 running 之前崩溃，id 已从队列消失，任务会停在 `pending`。
+- **影响**：极端时序下任务可能停留在 `pending` 而非 `failed`，需要 `REPOPILOT_RECONCILE_PENDING_ON_STARTUP=true` 或人工 retry；不会误报成功。
+- **建议**：改用 Redis Streams + consumer group + `XAUTOCLAIM`（可见性超时重投），或 `BRPOPLPUSH` 到处理中队列并定时回收。
+
+## 32. 锁获取失败的对外语义
+
+- **问题**：发布锁被占用时返回 `skipped / publish_in_progress`，与「门禁未过」同为 `skipped`。
+- **当前处理**：返回 `PublishOutcome(status="skipped", error_code="publish_in_progress")`，不落库、不改任务状态。
+- **影响**：调用方需自行区分「未获锁（可退避重试）」与「门禁跳过（无需重试）」。
+- **建议**：为 `publish_in_progress` 增加 `retryable=true` 标记，或直接返回 409/429。
+
+## 33. PostgreSQL schema 迁移策略
+
+- **问题**：设计文档未定义表结构演进方式。
+- **当前处理**：只用 `CREATE TABLE / INDEX IF NOT EXISTS` 支持首次建表；`payload` JSONB 内字段随 `Report.schema_version` 演进。
+- **影响**：新增顶层列或调整索引需手工迁移，无版本表。
+- **建议**：引入 Alembic 或轻量 `schema_migrations` 表，并约定 `payload` 的向后兼容读取。
+
+## 34. 去重窗口与重试语义
+
+- **问题**：去重只针对「非终态」任务；终态后重复提交会新建任务。
+- **当前处理**：`find_active_by_key` 只匹配非终态任务；终态任务经 `POST /api/tasks/{id}/retry` 生成新任务（`retried_from` 指向原任务）。
+- **影响**：首个任务结束后，短时间内重复提交同一请求会产生第二个任务（刻意行为，便于重试）。
+- **建议**：如需强去重，增加「最近 N 分钟终态复用」策略，或要求调用方显式携带幂等键。
+
+## 35. worker 横向扩展与心跳
+
+- **问题**：多 worker 共享队列时，如何判断 worker 存活、如何优雅下线。
+- **当前处理**：`running` 集合 + 启动时 `reconcile_incomplete_tasks`；无 per-worker 心跳/租约。
+- **影响**：若多个 worker 同时启动，启动恢复可能把另一个存活 worker 正在执行的任务误判为中断；因此默认只依赖「本进程启动前的遗留」。
+- **建议**：为 `running` 增加 worker 标识与心跳/租约，仅回收租约过期的任务。
+
+## 36. Dify 鉴权与多租户
+
+- **问题**：设计文档未定义 Dify 到后端的鉴权与租户隔离。
+- **当前处理**：适配端点复用后端权限模型（无独立鉴权），仅当 `REPOPILOT_ENABLE_DIFY=true` 时挂载。
+- **影响**：任何能访问该端点的一方都能触发任务；无租户隔离。
+- **建议**：为适配端点增加 API Key / 签名校验，并把调用方身份写入任务记录。
+
+## 37. 队列轮询粒度与取消延迟
+
+- **问题**：`blpop` 超时为整秒，空闲 worker 的取消响应最坏延迟约 1 秒。
+- **当前处理**：`pop(timeout)` 把秒数向上取整为 ≥1 秒。
+- **影响**：取消/取消传播在极端情况下有约 1 秒延迟（协作式取消，非强制中断）。
+- **建议**：需要更灵敏的取消时改用 Redis Streams 或阻塞 + 事件通道。
+
+## 设计文档契约修订说明
+
+阶段四**未修改** `RepoPilot.md` 的契约小节；阶段四交付与 §2.1 / §3.6 / §5 的既有约束一致（Dify 不承担核心执行、LangGraph 不经手权限与 GitHub 凭据、门禁前置、默认不自动合并）。此处仅登记实现细节与新增未决问题。

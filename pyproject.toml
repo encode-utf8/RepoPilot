@@ -23,6 +23,10 @@ dev = [
 ]
 audit = ["pip-audit>=2.7"]
 
+# Optional external services for the async deployment (phase 4). The default
+# install and the whole test suite run without these.
+services = ["redis>=5.0", "psycopg[binary]>=3.1"]
+
 [tool.setuptools]
 package-dir = { "" = "src" }
 
@@ -42,6 +46,7 @@ select = ["E", "F", "W", "I", "B", "UP", "C4", "SIM", "RET", "RUF"]
 # FastAPI reads dependency defaults as the injection point, so Depends(...) in a
 # default argument is the framework idiom rather than an accidental mutable default.
 "src/repopilot/api/routes.py" = ["B008"]
+"src/repopilot/integrations/dify.py" = ["B008"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src", "tests"]

@@ -13,7 +13,7 @@
 | 阶段一 | 仓库接入与评估基线 | **已完成（本迭代）** |
 | 阶段二 | Agent 自动修复闭环 | **已完成（本迭代）** |
 | 阶段三 | GitHub 自动提交与 Draft PR | **已完成（本迭代）** |
-| 阶段四 | 异步任务管理与交互整合 | 未开始 |
+| 阶段四 | 异步任务管理与交互整合 | **已完成（本迭代）** |
 | 阶段五 | 代码检索增强与评测工具链 | 未开始 |
 | 阶段六 | Agentic RL 能力扩展 | 未开始 |
 
@@ -40,8 +40,9 @@
 
 | 边界 | 协议位置 | 阶段一实现 | 后续替换方向 |
 |---|---|---|---|
-| `TaskStore` | `src/repopilot/storage/base.py` | `InMemoryTaskStore` | PostgreSQL（阶段四） |
-| `TaskScheduler` | `src/repopilot/scheduler/base.py` | `ThreadPoolTaskScheduler` | Redis / 任务队列（阶段四） |
+| `TaskStore` | `src/repopilot/storage/base.py` | `InMemoryTaskStore` | `PostgresTaskStore`（阶段四已接入） |
+| `TaskScheduler` | `src/repopilot/scheduler/base.py` | `ThreadPoolTaskScheduler` | `QueueTaskScheduler` + Redis 队列（阶段四已接入） |
+| `LockManager` | `src/repopilot/locking.py` | `InMemoryLockManager` | `RedisLockManager`（阶段四已接入） |
 | `SandboxExecutor` | `src/repopilot/execution/sandbox.py` | `LocalProcessSandboxExecutor` | Docker 隔离执行 |
 | `Checker` | `src/repopilot/checkers/base.py` | Ruff / pytest / pip-audit / heuristics | 新增或替换检查器 |
 | `ModelClient` | `src/repopilot/llm/base.py` | `StubModelClient` / `OpenAICompatibleModelClient` | 真实 vLLM 或其它推理后端 |
@@ -142,6 +143,72 @@ $env:REPOPILOT_GITHUB_TOKEN = "<token>"           # 仅写入进程环境，绝�
 $env:REPOPILOT_GITHUB_REPO_SLUG = "acme/widget"   # 本地镜像仓库时指定远端 owner/name
 ```
 
+## 阶段四交付内容
+
+把前面三个阶段预留的抽象边界替换为可插拔的持久化 / 队列 / 锁实现，上层业务逻辑保持不变：`POST /api/tasks` 仍然只创建任务并立即返回，任务由独立 worker 拉取执行。
+
+| 能力 | 实现位置 |
+|---|---|
+| PostgreSQL `TaskStore`（JSONB + 顶层索引列） | `src/repopilot/storage/postgres.py` |
+| Redis `TaskQueue`（list + set，running / 取消集合） | `src/repopilot/queue/redis_queue.py` |
+| 队列版 `TaskScheduler`（兼容 `ThreadPoolTaskScheduler` 接口） | `src/repopilot/queue/scheduler.py` |
+| 内存队列（默认与全部测试使用，无外部依赖） | `src/repopilot/queue/memory.py` |
+| 后台 worker（拉取 → 解析 runner → 执行 → 收敛状态） | `src/repopilot/queue/worker.py`、`src/repopilot/worker.py` |
+| 任务创建服务（去重 + 入队 + 重试） | `src/repopilot/service.py` |
+| 跨进程分布式锁（发布 / 去重临界区） | `src/repopilot/locking.py` |
+| 崩溃恢复（running → failed / `worker_lost`） | `src/repopilot/ops/recovery.py` |
+| Dify 适配（触发 / 查询 / 取消 / 渲染） | `src/repopilot/integrations/dify.py` |
+| 后端装配（memory / postgres / redis 按配置切换） | `src/repopilot/bootstrap.py` |
+
+### 任务生命周期
+
+创建任务 → 写入持久化存储（`pending`）→ 推送 `task_id` 到队列 → worker 拉取执行 → 逐轮写入结构化日志 → 终态（`succeeded` / `failed` / `needs_review` / `cancelled`）与报告落库 → 通过 API 查询进度、资源用量与最终结果。
+
+### 跨进程幂等与去重
+
+- **发布幂等**：`PullRequestPublisher` 用 `publish:<task_id>` 分布式锁包裹整段发布逻辑；未获锁的并发调用直接返回 `status=skipped, error_code=publish_in_progress`，**不写入任何状态**，避免覆盖赢家结果。`tests/test_phase4_concurrency.py` 断言并发发布只产生一个分支/PR。
+- **任务去重**：`TaskService.submit` 用 `dedupe:<sha1(dedupe_key)>` 锁保护「查重 → 插入」临界区。抢锁失败的一方短暂等待赢家落库后返回同一 `task_id`（`deduplicated: true`），绝不创建第二个任务；等待超时返回 409 `task_conflict`。
+
+### 崩溃恢复
+
+worker 中途被杀时任务会停在 `running`。重启时（`python -m repopilot.worker` 启动即执行，或 API 侧 `REPOPILOT_RECONCILE_RUNNING_ON_STARTUP=true`）调用 `reconcile_incomplete_tasks`，把 `running`（可选 `pending`）收敛为 `failed` + `failure_code=worker_lost`，并在报告 `verification.verification_gaps` 记录缺口——**不会永久卡在 running，也不会误报成功**。
+
+### 可观测性
+
+- 统一 JSONL 结构化日志（`task_id` + `run_id`），用 `GET /api/tasks/{id}/logs?tail=N` 读取；worker 生命周期（`worker.started` / `worker.crashed` / `worker.cancelled`）与发布（`pr.created` / `pr.locked` / `pr.failed`）均入日志。
+- 资源用量集中在 `GET /api/tasks/{id}/usage`：模型 token / 调用次数 / 延迟、工具调用次数、任务耗时、沙箱资源上限与发布结果。
+- 失败通过 `failure_code` + `failure_reason` + 报告 `verification` 统一暴露，可按 `task_id` 追踪。
+
+### Dify 接入（设计文档 §2.1 硬约束）
+
+Dify 只是任务触发、参数传递与结果展示入口，**不承担核心执行逻辑**；LangGraph 不经手任何权限与 GitHub 凭据。适配器把 Dify 工具请求映射到既有任务 API，并把结果渲染成工具友好的结构。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `POST` | `/api/integrations/dify/tasks` | 触发任务（接受 `{"inputs": {...}}` 或裸对象），返回 `text` + 结构化 `result` |
+| `GET` | `/api/integrations/dify/tasks/{task_id}` | 查询进度与结果 |
+| `POST` | `/api/integrations/dify/tasks/{task_id}/cancel` | 请求取消 |
+
+仅当 `REPOPILOT_ENABLE_DIFY=true` 时挂载；Dify 联调**不是 CI 必需项**，无 Dify 时全部默认测试照常通过。
+
+### 本机异步部署（可选）
+
+默认测试不需要任何外部服务；需要真实后端时用 compose 起 Redis + PostgreSQL：
+
+```powershell
+docker compose up -d
+$env:REPOPILOT_SCHEDULER_BACKEND = "queue"
+$env:REPOPILOT_QUEUE_BACKEND = "redis"
+$env:REPOPILOT_LOCK_BACKEND = "redis"
+$env:REPOPILOT_TASK_STORE_BACKEND = "postgres"
+
+# API 进程（只创建任务并立即返回）
+.\.venv\Scripts\python.exe -m repopilot
+
+# 独立 worker 进程（可横向扩展多个）
+.\.venv\Scripts\python.exe -m repopilot.worker
+```
+
 ## 快速开始
 
 ```powershell
@@ -176,6 +243,9 @@ Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/tasks/$($task.task_id)/report"
 | `GET` | `/api/tasks/{task_id}/logs` | 获取结构化 JSONL 日志（支持 `?tail=N`） |
 | `POST` | `/api/tasks/{task_id}/cancel` | 请求协作式取消（202）；任务已是终态时返回 409 |
 | `POST` | `/api/tasks/{task_id}/pull-request` | 为门禁通过的修复创建/复用 Draft PR；任务未到终态返回 409 |
+| `GET` | `/api/tasks` | 列出任务（`?status=` 过滤、`?limit=` 上限），最新在前 |
+| `GET` | `/api/tasks/{task_id}/usage` | 资源与进度视图（token / 延迟 / 轮次 / 沙箱资源 / 发布结果） |
+| `POST` | `/api/tasks/{task_id}/retry` | 重新运行一个已结束任务（新 `task_id`，`retried_from` 指向原任务）；未到终态返回 409 |
 | `GET` | `/api/health` | 健康检查（非任务端点） |
 
 请求体：
@@ -300,6 +370,20 @@ $env:REPOPILOT_MODEL_API_KEY = "EMPTY"   # vLLM 默认不校验
 | `REPOPILOT_DOCKER_IMAGE` | `python:3.11-slim` | 容器镜像 |
 | `REPOPILOT_CONTAINER_MEMORY` / `_CPUS` / `_PIDS_LIMIT` | `1g` / `1.0` / `256` | 容器资源上限 |
 | `REPOPILOT_CONTAINER_TIMEOUT_SECONDS` | `600` | 容器单条命令超时 |
+| `REPOPILOT_SCHEDULER_BACKEND` | `thread` | `thread`（线程池）或 `queue`（走队列 + worker） |
+| `REPOPILOT_QUEUE_BACKEND` | `memory` | `memory` 或 `redis` |
+| `REPOPILOT_LOCK_BACKEND` | `memory` | `memory` 或 `redis`（发布 / 去重分布式锁） |
+| `REPOPILOT_TASK_STORE_BACKEND` | `memory` | `memory` 或 `postgres` |
+| `REPOPILOT_REDIS_URL` | `redis://127.0.0.1:6379/0` | Redis 连接串 |
+| `REPOPILOT_REDIS_KEY_PREFIX` | `repopilot:` | Redis key 前缀 |
+| `REPOPILOT_POSTGRES_DSN` | `postgresql://repopilot:repopilot@127.0.0.1:5432/repopilot` | PostgreSQL 连接串 |
+| `REPOPILOT_WORKER_ENABLED` | `false` | API 进程内是否同时启动 worker 线程 |
+| `REPOPILOT_WORKER_POLL_TIMEOUT_SECONDS` | `1.0` | worker 空闲轮询超时 |
+| `REPOPILOT_RECONCILE_RUNNING_ON_STARTUP` | `true` | 启动时把 running 任务收敛为 failed |
+| `REPOPILOT_RECONCILE_PENDING_ON_STARTUP` | `false` | 启动时是否也收敛 pending 任务 |
+| `REPOPILOT_PUBLISH_LOCK_TTL_SECONDS` | `600` | 发布锁 TTL |
+| `REPOPILOT_DEDUPE_LOCK_TTL_SECONDS` | `30` | 去重锁 TTL |
+| `REPOPILOT_ENABLE_DIFY` | `false` | 是否挂载 Dify 适配端点 |
 
 ## Fixtures 与测试
 
@@ -323,11 +407,23 @@ $env:REPOPILOT_MODEL_API_KEY = "EMPTY"   # vLLM 默认不校验
 
 阶段三在 `tests/test_publish.py`、`tests/test_container_sandbox.py`、`tests/test_phase3_e2e.py` 增加：伪造 GitHub API 的端到端测试（门禁通过 → 建分支 → 提交 → Draft PR → 任务记录含 PR 链接）；门禁拦截时断言零远端写；权限不足 / 冲突 / API 失败 / 重复提交的状态与错误码；容器 argv 加固断言；以及凭据不进入日志、报告、状态文件与沙箱环境。
 
+阶段四在 `tests/test_locking.py`、`tests/test_queue.py`、`tests/test_service.py`、`tests/test_worker.py`、`tests/test_recovery.py`、`tests/test_postgres_store.py`、`tests/test_redis_backends.py`、`tests/test_dify.py`、`tests/test_phase4_e2e.py`、`tests/test_phase4_concurrency.py` 增加：队列版端到端（任务入队 → worker 执行 → 状态落库 → 可查询进度与最终结果）；并发发布只产生一个分支/PR；去重只执行一次；崩溃恢复把 running 收敛为 `worker_lost`；Dify 触发 / 查询 / 取消。Redis / PostgreSQL 默认用内存或 fake 实现，真实后端由 `tests/test_integration_services.py` 经环境变量开关覆盖：
+
+```powershell
+docker compose up -d
+$env:REPOPILOT_TEST_REDIS_URL = "redis://127.0.0.1:6379/0"
+$env:REPOPILOT_TEST_POSTGRES_DSN = "postgresql://repopilot:repopilot@127.0.0.1:5432/repopilot"
+.\.venv\Scripts\python.exe -m pytest tests/test_integration_services.py
+# 未设置环境变量时这两个用例自动 skip，默认套件不依赖外部服务、无需网络
+```
+
 ## 本迭代明确不做
 
 阶段二明确不做：任何 GitHub 写操作（分支 / 提交 / Draft PR）、Redis / PostgreSQL / Dify、Milvus / 向量检索、Agentic RL，以及「自主判断并修复任意仓库的任意问题」。代码执行路径仍默认关闭，仅在受控 fixture 上启用。
 
 阶段三明确不做：自动合并、推送到默认分支、Redis / PostgreSQL / Dify、Milvus / 向量检索、Agentic RL。首版仅 Draft PR，远端写操作只能由后端 PR 模块执行，且默认要求容器隔离。
+
+阶段四明确不做：自动合并、Milvus / 向量检索、Agentic RL；不改动发布模块的写语义。默认测试不依赖 Redis / PostgreSQL / Dify，无网络时全部默认测试通过。
 
 ## 目录结构
 
@@ -335,11 +431,16 @@ $env:REPOPILOT_MODEL_API_KEY = "EMPTY"   # vLLM 默认不校验
 RepoPilot.md                  # 项目设计文档（唯一事实来源）
 README.md
 pyproject.toml                # 依赖、ruff 与 pytest 配置
+docker-compose.yml            # 本地 Redis + PostgreSQL（阶段四集成测试）
 docs/open-questions.md        # 设计文档未定义处的决策记录
 fixtures/                     # 受控 fixture 仓库模板
 scripts/make_fixtures.py      # 物化 fixture 为真实 git 仓库
 src/repopilot/agent/          # LangGraph 修复工作流、受控工具集、质量门禁
 src/repopilot/llm/            # 模型抽象（stub / OpenAI 兼容 vLLM 客户端）
+src/repopilot/queue/          # 任务队列（内存 / Redis）、队列调度器与 worker
+src/repopilot/storage/        # TaskStore（内存 / PostgreSQL）
+src/repopilot/ops/            # 运维助手（启动崩溃恢复）
+src/repopilot/integrations/   # 交互适配（Dify）
 src/repopilot/                # 后端服务与评估流水线
 tests/                        # 单元测试与端到端回归测试
 ```
